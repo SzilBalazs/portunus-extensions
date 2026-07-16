@@ -1,0 +1,6 @@
+# Build artifacts — CI builds from source; never commit binaries.
+target/
+extension.wasm
+*.portext
+site/
+Cargo.lock

@@ -1,0 +1,131 @@
+name: validate
+
+# PR gate: build every changed extension from source, validate it with the
+# real Portunus CLI (same manifest parser + wasm export scan the host uses),
+# enforce the version-bump rule, and comment the permission summary on the PR.
+# The permission list in that comment is the reviewer's consent surface -
+# what's reviewed here is exactly what the index will advertise.
+
+on:
+  pull_request:
+
+env:
+  LIVE_INDEX: https://szilbalazs.github.io/portunus-extensions/index.json
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed extensions
+        id: changed
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          dirs=$(git diff --name-only "$base"...HEAD -- extensions/ \
+            | cut -d/ -f2 | sort -u \
+            | while read -r d; do [ -d "extensions/$d" ] && echo "$d"; done)
+          echo "dirs<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$dirs" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          if [ -z "$dirs" ]; then echo "No extension changes."; fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.changed.outputs.dirs != ''
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.changed.outputs.dirs != ''
+        with:
+          workspaces: |
+            extensions/emoji
+            extensions/cheatsh
+            extensions/gh
+
+      - name: Install Portunus CLI
+        if: steps.changed.outputs.dirs != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo SzilBalazs/portunus --pattern '*_amd64.deb' --dir /tmp/portunus-deb
+          sudo apt-get update
+          sudo apt-get install -y /tmp/portunus-deb/portunus_*_amd64.deb
+
+      - name: Build, validate, pack
+        if: steps.changed.outputs.dirs != ''
+        run: |
+          set -e
+          summary=""
+          for name in ${{ steps.changed.outputs.dirs }}; do
+            dir="extensions/$name"
+            echo "::group::$name"
+            (cd "$dir" && cargo build --release)
+            wasm=$(find "$dir/target/wasm32-unknown-unknown/release" -maxdepth 1 -name '*.wasm' | head -1)
+            cp "$wasm" "$dir/extension.wasm"
+            portunus ext validate "$dir"
+            (cd "$dir" && portunus ext pack .)
+            # Permission summary straight from the manifest (the consent surface).
+            summary+=$(python3 - "$dir/manifest.toml" <<'EOF'
+          import sys, tomllib
+          m = tomllib.load(open(sys.argv[1], "rb"))
+          p = m.get("permissions", {})
+          rows = []
+          if p.get("network"): rows.append("network: " + ", ".join(sorted(p["network"])))
+          for k in ("kv", "clipboard", "open_url", "paste"):
+              if p.get(k): rows.append(k)
+          if p.get("spawn"): rows.append("**spawn (sandbox-breaking): " + ", ".join(sorted(p["spawn"])) + "**")
+          if any(s.get("type") == "secret" for s in m.get("settings", [])): rows.append("secrets (keyring)")
+          perms = "; ".join(rows) if rows else "none - fully sandboxed"
+          print(f"| `{m['name']}` | v{m['version']} | api {m['api']} | {perms} |")
+          EOF
+            )$'\n'
+            echo "::endgroup::"
+          done
+          {
+            echo "PERMISSION_TABLE<<EOF"
+            printf '%s' "$summary"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Enforce version bump for published versions
+        if: steps.changed.outputs.dirs != ''
+        run: |
+          python3 - ${{ steps.changed.outputs.dirs }} <<'EOF'
+          import json, sys, tomllib, urllib.request, urllib.error, os
+          url = os.environ["LIVE_INDEX"]
+          try:
+              with urllib.request.urlopen(url, timeout=30) as r:
+                  live = {e["name"]: e["version"] for e in json.load(r)["extensions"]}
+          except (urllib.error.URLError, urllib.error.HTTPError):
+              print("live index unavailable - skipping (first publish?)")
+              sys.exit(0)
+          failed = False
+          for name in sys.argv[1:]:
+              m = tomllib.load(open(f"extensions/{name}/manifest.toml", "rb"))
+              if live.get(name) == m["version"]:
+                  print(f"::error::{name} v{m['version']} is already published - bump the version")
+                  failed = True
+          sys.exit(1 if failed else 0)
+          EOF
+
+      - name: Comment permission summary
+        if: steps.changed.outputs.dirs != '' && env.PERMISSION_TABLE != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "### Extension review summary"
+            echo ""
+            echo "| extension | version | api | permissions |"
+            echo "|---|---|---|---|"
+            printf '%s' "$PERMISSION_TABLE"
+            echo ""
+            echo "Reviewers: approving this PR approves the source **and** the permission grants above - they become the consent surface users see in the launcher."
+          } > /tmp/comment.md
+          gh pr comment ${{ github.event.pull_request.number }} --body-file /tmp/comment.md --create-if-none --edit-last

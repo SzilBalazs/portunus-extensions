@@ -1,0 +1,70 @@
+name: publish
+
+# main → GitHub Pages: build every extension from source, pack, generate
+# index.json, deploy the whole site atomically. Published (name, version)
+# packages are immutable - generate_index.py reuses the live bytes for
+# versions that are already out, so the index sha always matches what users
+# download (validate.yml forces a version bump when content changes).
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  BASE_URL: https://szilbalazs.github.io/portunus-extensions
+  LIVE_INDEX: https://szilbalazs.github.io/portunus-extensions/index.json
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            extensions/emoji
+            extensions/cheatsh
+            extensions/gh
+
+      - name: Build all extensions
+        run: |
+          set -e
+          for dir in extensions/*/; do
+            name=$(basename "$dir")
+            echo "::group::$name"
+            (cd "$dir" && cargo build --release)
+            wasm=$(find "$dir/target/wasm32-unknown-unknown/release" -maxdepth 1 -name '*.wasm' | head -1)
+            cp "$wasm" "$dir/extension.wasm"
+            echo "::endgroup::"
+          done
+
+      - name: Generate site
+        run: |
+          python3 scripts/generate_index.py \
+            --site site \
+            --base-url "$BASE_URL" \
+            --live-url "$LIVE_INDEX"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

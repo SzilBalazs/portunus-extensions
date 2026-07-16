@@ -1,0 +1,28 @@
+api = 4
+name = "emoji"
+version = "0.3.0"
+description = "Search emoji by name and copy them to the clipboard"
+author = "Portunus examples"
+kinds = ["ext-emoji"]
+
+# One searchable command: found by fuzzy-matching its title/keywords, entered
+# from the "Search Emoji" entry. An empty scope query shows the browse list.
+[[commands]]
+name = "search"
+title = "Search Emoji"
+description = "Find and copy emoji by name"
+mode = "scope"
+keywords = ["emoji", "em", "smiley", "emoticon"]
+chip = "Emoji"
+placeholder = "Search emoji…"
+
+[limits]
+search_timeout_ms = 100
+
+[[settings]]
+key = "tone"
+type = "select"
+label = "Skin tone modifier"
+description = "Applied to hand emoji like thumbs up"
+default = "none"
+options = ["none", "light", "medium", "dark"]

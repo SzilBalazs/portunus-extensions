@@ -1,0 +1,31 @@
+api = 4
+name = "cheatsh"
+version = "0.3.0"
+description = "Look up command cheat sheets from cheat.sh"
+author = "Portunus examples"
+kinds = ["ext-cheatsh"]
+
+# A scope command: found by fuzzy-searching its title/keywords, entered from
+# its entry, then every keystroke routes to the extension as the whole term.
+[[commands]]
+name = "search"
+title = "Search Cheat Sheets"
+description = "cheat.sh command lookups"
+mode = "scope"
+keywords = ["ch", "cheat", "cheatsheet", "man"]
+chip = "Cheat"
+placeholder = "Command to look up…"
+
+[permissions]
+network = ["cheat.sh"]
+kv = true
+
+[limits]
+search_timeout_ms = 50
+activate_timeout_ms = 5000
+# The async `query` export hits cheat.sh live, off the keystroke path.
+query_timeout_ms = 8000
+
+# Warm the :list cache off the keystroke path (also runs once at load).
+[background]
+refresh_interval_secs = 86400

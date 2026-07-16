@@ -1,0 +1,14 @@
+[package]
+name = "cheatsh"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+portunus-ext-sdk = { git = "https://github.com/SzilBalazs/portunus", tag = "v0.3.0" }
+
+[profile.release]
+opt-level = "s"
+lto = true
