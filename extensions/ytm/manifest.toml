@@ -32,13 +32,21 @@ min_query_len = 0
 chip = "YT Queue"
 icon = "icon.b64"
 placeholder = "Filter the queue…"
+# Queue order is intrinsic (playback position) - opt out of frecency so a
+# frequently-skipped track never floats to the top. Pairs with the stable
+# row ids that let a post-skip RefreshResults update in place.
+frecency = false
 
 [permissions]
 # Talk to the Firefox companion (personalized search + queue control).
 bus = true
-# Album-art hosts (lh3/yt3), fetched on demand for the selection preview.
+# Cache queue-row album art (videoId -> base64) so icons load instantly after
+# the first fetch and survive skip/refresh.
+kv = true
+# Album-art hosts, fetched on demand for the selection preview and queue-row
+# icons. Search results use lh3/yt3; queue thumbnails come from i.ytimg.com.
 # Search and playback go through the companion, not the network.
-network = ["lh3.googleusercontent.com", "yt3.googleusercontent.com"]
+network = ["lh3.googleusercontent.com", "yt3.googleusercontent.com", "i.ytimg.com"]
 # "Open in browser" action + the web-search placeholder.
 open_url = true
 

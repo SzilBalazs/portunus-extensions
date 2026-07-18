@@ -84,12 +84,10 @@ impl Song {
     }
 }
 
-/// Decodes a `song:<json>` (search) or `qitem:<salt>:<json>` (queue) result id
-/// back into its metadata. Both pack the same `SongMeta`; queue ids prepend a
-/// per-snapshot salt (see `queue_result`), so the JSON starts at the first '{'.
+/// Decodes a `song:<json>` (search) or `qitem:<json>` (queue) result id back
+/// into its metadata. Both pack the same `SongMeta`.
 fn decode_meta(id: &str) -> Option<SongMeta> {
-    let body = id.strip_prefix("song:").or_else(|| id.strip_prefix("qitem:"))?;
-    let json = &body[body.find('{')?..];
+    let json = id.strip_prefix("song:").or_else(|| id.strip_prefix("qitem:"))?;
     serde_json::from_str(json).ok()
 }
 
@@ -162,13 +160,12 @@ fn queue_actions() -> Vec<Action> {
 /// Maps a queue row to a launcher result. The now-playing track floats to the
 /// top with a badge; the rest keep queue order via descending relevance.
 ///
-/// `salt` is a per-snapshot value baked into the id. The host records frecency
-/// on every activation (a skip_to counts) keyed by the full result id, and a
-/// single frecency bonus can dwarf the whole extension relevance band - so a
-/// stable id would let previously-skipped tracks bubble to the top and wreck
-/// the queue order. Salting the id per snapshot keeps it frecency-neutral; the
-/// salt sits before the JSON and `decode_meta` skips over it.
-fn queue_result(r: &QueueRow, n: usize, salt: u64) -> ExtensionResult {
+/// The id is stable (position + metadata), which the launcher needs so a
+/// RefreshResults after skip/remove updates rows in place instead of stacking
+/// duplicates. The queue command sets `frecency = false` in the manifest, so
+/// these stable ids never accrue a usage-history bonus that would reorder the
+/// list - the two go together.
+fn queue_result(r: &QueueRow, n: usize, row_icon: portunus_ext_sdk::ResultIcon) -> ExtensionResult {
     let meta = SongMeta {
         v: r.video_id.clone(),
         a: r.artist.clone(),
@@ -181,14 +178,88 @@ fn queue_result(r: &QueueRow, n: usize, salt: u64) -> ExtensionResult {
         if r.current { 100.0 } else { 99.0 - (r.index as f32 / n.max(1) as f32) * 90.0 };
     let badge = if r.current { Some("\u{25B6} Now playing".into()) } else { r.duration.clone() };
     ExtensionResult {
-        id: format!("qitem:{}:{}", salt, serde_json::to_string(&meta).unwrap_or_default()),
+        id: format!("qitem:{}", serde_json::to_string(&meta).unwrap_or_default()),
         title: r.title.clone(),
         subtitle: if r.artist.is_empty() { None } else { Some(r.artist.clone()) },
         relevance,
         actions: queue_actions(),
-        icon: Some(icon()),
+        icon: Some(row_icon),
         badge,
     }
+}
+
+/// Per-query cap on *new* album-art fetches. Cache hits are unlimited; misses
+/// beyond this fall back to the generic icon and warm on a later open. Keeps
+/// the query snappy on a cold cache (each fetch is a blocking HTTP round-trip).
+const ART_FETCH_BUDGET: usize = 16;
+
+/// Resolves a queue row's icon: KV cache first, then a bounded live fetch of a
+/// downsized thumbnail (cached for next time), else the generic YTM icon.
+fn row_icon(video_id: &str, thumb: Option<&str>, budget: &mut usize) -> portunus_ext_sdk::ResultIcon {
+    if video_id.is_empty() {
+        return icon();
+    }
+    let key = format!("art:{video_id}");
+    if let Ok(Some(v)) = guest::kv_read(&key) {
+        if let Some((mime, b64)) = v.split_once('\t') {
+            return portunus_ext_sdk::ResultIcon { mime: mime.into(), data_base64: b64.into() };
+        }
+    }
+    if *budget == 0 {
+        return icon();
+    }
+    if let Some(url) = thumb.filter(|s| !s.is_empty()) {
+        if let Some((mime, b64)) = fetch_icon_b64(&small_thumb_url(url, 48)) {
+            *budget -= 1;
+            let _ = guest::kv_write(&key, &format!("{mime}\t{b64}"));
+            return portunus_ext_sdk::ResultIcon { mime, data_base64: b64 };
+        }
+    }
+    icon()
+}
+
+/// Rewrites an art URL to a small, fast-to-fetch variant, per host:
+/// - `i.ytimg.com/vi/<id>/<q>.jpg?...` (queue thumbs) -> `.../default.jpg`
+///   (120x90, no signed query params).
+/// - `*.googleusercontent.com/...=w..-h..` (search art) -> a `px` square.
+/// Both stay well under the 32 KB icon cap. Unknown shapes pass through.
+fn small_thumb_url(url: &str, px: u32) -> String {
+    if url.contains("ytimg.com") {
+        // Drop the filename + query and use the small unsigned `default.jpg`.
+        if let Some(slash) = url.rfind('/') {
+            return format!("{}/default.jpg", &url[..slash]);
+        }
+        return url.to_string();
+    }
+    // googleusercontent carries a `=w..-h..` size suffix.
+    match url.rfind('=') {
+        Some(eq) => format!("{}=w{px}-h{px}-l90-rj", &url[..eq]),
+        None => format!("{url}=w{px}-h{px}"),
+    }
+}
+
+/// Fetches an image and returns `(mime, base64)`, or None on any failure. Skips
+/// anything that would exceed the icon cap once base64-expanded.
+fn fetch_icon_b64(url: &str) -> Option<(String, String)> {
+    let mut req = HttpRequest::new(url.to_string());
+    req.method = Some("GET".into());
+    let resp = http::request::<&[u8]>(&req, None).ok()?;
+    if resp.status_code() != 200 {
+        return None;
+    }
+    let bytes = resp.body();
+    // 20 KB raw -> ~27 KB base64, safely under the 32 KB cap.
+    if bytes.is_empty() || bytes.len() > 20 * 1024 {
+        return None;
+    }
+    let mime = if url.contains(".png") {
+        "image/png"
+    } else if url.contains(".webp") {
+        "image/webp"
+    } else {
+        "image/jpeg"
+    };
+    Some((mime.to_string(), base64_encode(&bytes)))
 }
 
 /// Asks the companion for the current queue. Reply shape: `{ "ok": true,
@@ -222,26 +293,44 @@ fn companion_get_queue() -> Result<Vec<QueueRow>, String> {
     Ok(rows)
 }
 
-/// Emits queue rows, optionally filtered by a substring the user typed.
+/// Emits queue rows in two passes: first the whole list with the generic icon
+/// (instant), then the same rows re-emitted with album art (cache + a bounded
+/// live fetch). Both passes use the same ids (same salt), so the second replaces
+/// the first in place - the list shows immediately and art fills in after.
 fn emit_queue(rows: &[QueueRow], term: &str) {
     let t = term.trim().to_lowercase();
     let n = rows.len();
-    // One salt per snapshot keeps the row ids frecency-neutral (see queue_result).
-    let salt = guest::now().unwrap_or(0);
-    let results: Vec<ExtensionResult> = rows
+
+    let visible: Vec<&QueueRow> = rows
         .iter()
         .filter(|r| {
             t.is_empty()
                 || r.title.to_lowercase().contains(&t)
                 || r.artist.to_lowercase().contains(&t)
         })
-        .map(|r| queue_result(r, n, salt))
         .collect();
-    if results.is_empty() {
+    if visible.is_empty() {
         emit_message("No matching tracks", "Nothing in the queue matches that");
-    } else {
-        let _ = guest::emit(results);
+        return;
     }
+
+    // Pass 1: instant, generic icons.
+    let plain: Vec<ExtensionResult> =
+        visible.iter().map(|r| queue_result(r, n, icon())).collect();
+    let _ = guest::emit(plain);
+
+    // Pass 2: same rows with art (cache hits are free; misses fetch up to the
+    // budget). When the cache is warm this is near-instant and coalesces with
+    // pass 1; on a cold cache the list is already visible while art loads.
+    let mut budget = ART_FETCH_BUDGET;
+    let with_art: Vec<ExtensionResult> = visible
+        .iter()
+        .map(|r| {
+            let ic = row_icon(&r.video_id, r.thumb.as_deref(), &mut budget);
+            queue_result(r, n, ic)
+        })
+        .collect();
+    let _ = guest::emit(with_art);
 }
 
 // ===========================================================================

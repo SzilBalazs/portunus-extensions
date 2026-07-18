@@ -219,6 +219,13 @@
     return Array.isArray(t) && t.length ? t[0].url || "" : "";
   }
 
+  // Just the artist name — the first segment of the byline, before the
+  // " • album • year" tail — so queue rows read like YouTube Music's own list.
+  function firstArtist(r) {
+    const full = text(r.longBylineText) || text(r.shortBylineText);
+    return full.split("•")[0].trim();
+  }
+
   // A queue item may be a bare playlistPanelVideoRenderer or a wrapper around
   // one (playlistPanelVideoWrapperRenderer.primaryRenderer). Return the panel.
   function panelRenderer(item) {
@@ -244,7 +251,7 @@
       out.push({
         videoId: r.videoId || "",
         title: text(r.title),
-        artist: text(r.longBylineText) || text(r.shortBylineText),
+        artist: firstArtist(r),
         duration: text(r.lengthText),
         thumbnail: smallThumb(r),
         index: i,
