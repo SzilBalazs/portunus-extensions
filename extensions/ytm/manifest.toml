@@ -1,0 +1,37 @@
+api = 5
+name = "ytm"
+version = "0.1.0"
+description = "Search YouTube Music and control playback - play now, play next, add to queue. Requires the Firefox companion (companions/firefox-ytm), which runs search and playback in your logged-in music.youtube.com tab."
+author = "Portunus examples"
+homepage = "https://music.youtube.com"
+kinds = ["ext-ytm"]
+
+# One scope command. Type a song/artist, results stream in from the logged-in
+# YouTube Music tab (via the companion) or from a public search as a fallback.
+[[commands]]
+name = "search"
+title = "YouTube Music"
+description = "Search songs and control playback"
+mode = "scope"
+keywords = ["ytm", "music", "yt", "song", "play"]
+min_query_len = 2
+chip = "YT Music"
+icon = "icon.b64"
+placeholder = "Search YouTube Music…"
+
+[permissions]
+# Talk to the Firefox companion (personalized search + queue control).
+bus = true
+# Album-art hosts (lh3/yt3), fetched on demand for the selection preview.
+# Search and playback go through the companion, not the network.
+network = ["lh3.googleusercontent.com", "yt3.googleusercontent.com"]
+# "Open in browser" action + the web-search placeholder.
+open_url = true
+
+[limits]
+# All the real work is the async query tier (bus round-trip or network).
+search_timeout_ms = 50
+query_timeout_ms = 10000
+activate_timeout_ms = 6000
+# Preview fetches one album-art image on selection.
+preview_timeout_ms = 8000

@@ -1,0 +1,21 @@
+[package]
+name = "ytm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The message-bus API (bus_attached / bus_call) ships in SDK v0.4.0 - the
+# marketplace CI builds against this tag. To build locally before it is
+# tagged, point the dep at a checkout with `--config`:
+#   cargo build --release --config \
+#     'patch."https://github.com/SzilBalazs/portunus".portunus-ext-sdk.path="../../../portunus/extension-sdk"'
+portunus-ext-sdk = { git = "https://github.com/SzilBalazs/portunus", tag = "v0.4.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
