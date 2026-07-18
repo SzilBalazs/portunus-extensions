@@ -1,6 +1,6 @@
 api = 5
 name = "ytm"
-version = "0.1.0"
+version = "0.2.0"
 description = "Search YouTube Music and control playback - play now, play next, add to queue. Requires the Firefox companion (companions/firefox-ytm), which runs search and playback in your logged-in music.youtube.com tab."
 author = "Portunus examples"
 homepage = "https://music.youtube.com"
@@ -18,6 +18,20 @@ min_query_len = 2
 chip = "YT Music"
 icon = "icon.b64"
 placeholder = "Search YouTube Music…"
+
+# Live queue view: lists the current queue, marks now-playing, skip-to / remove.
+# min_query_len = 0 so it populates on entry with no typing; a typed term
+# filters the queue client-side. Backed by the same companion bus.
+[[commands]]
+name = "queue"
+title = "YT Music Queue"
+description = "See the current queue - skip to or remove tracks"
+mode = "scope"
+keywords = ["queue", "q", "up next", "playing", "np"]
+min_query_len = 0
+chip = "YT Queue"
+icon = "icon.b64"
+placeholder = "Filter the queue…"
 
 [permissions]
 # Talk to the Firefox companion (personalized search + queue control).

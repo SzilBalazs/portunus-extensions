@@ -60,6 +60,10 @@ struct SongMeta {
     d: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     t: Option<String>,
+    /// Queue position (queue command only). Carried so activate can skip_to /
+    /// remove_from_queue by index; absent on search rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    i: Option<usize>,
 }
 
 impl Song {
@@ -75,13 +79,18 @@ impl Song {
             al: self.album.clone(),
             d: self.duration.clone(),
             t: self.thumb_url.clone(),
+            i: None,
         }
     }
 }
 
-/// Decodes the `song:<json>` result id back into its metadata.
+/// Decodes a `song:<json>` (search) or `qitem:<salt>:<json>` (queue) result id
+/// back into its metadata. Both pack the same `SongMeta`; queue ids prepend a
+/// per-snapshot salt (see `queue_result`), so the JSON starts at the first '{'.
 fn decode_meta(id: &str) -> Option<SongMeta> {
-    serde_json::from_str(id.strip_prefix("song:")?).ok()
+    let body = id.strip_prefix("song:").or_else(|| id.strip_prefix("qitem:"))?;
+    let json = &body[body.find('{')?..];
+    serde_json::from_str(json).ok()
 }
 
 /// The action menu shown on every song row. First = default (Enter).
@@ -90,11 +99,13 @@ fn song_actions() -> Vec<Action> {
     // queue several tracks in a row. `opens_form` is set on them not because
     // they open a form, but because it makes the host skip the optimistic hide
     // - otherwise the window flashes hidden-then-shown around the KeepOpen.
+    // `shortcut` is the suggested default chord - users can override or clear
+    // it in Settings → Keybinds. The default (first) action is Enter-bound.
     vec![
-        Action { id: "play_now".into(), label: "Play now".into(), hint: Some("in YouTube Music".into()), opens_form: false },
-        Action { id: "play_next".into(), label: "Play next".into(), hint: Some("after current track".into()), opens_form: true },
-        Action { id: "queue_last".into(), label: "Add to queue".into(), hint: Some("end of the queue".into()), opens_form: true },
-        Action { id: "open".into(), label: "Open in browser".into(), hint: None, opens_form: false },
+        Action { id: "play_now".into(), label: "Play now".into(), hint: Some("in YouTube Music".into()), opens_form: false, shortcut: None },
+        Action { id: "play_next".into(), label: "Play next".into(), hint: Some("after current track".into()), opens_form: true, shortcut: Some("ctrl+n".into()) },
+        Action { id: "queue_last".into(), label: "Add to queue".into(), hint: Some("end of the queue".into()), opens_form: true, shortcut: Some("ctrl+q".into()) },
+        Action { id: "open".into(), label: "Open in browser".into(), hint: None, opens_form: false, shortcut: Some("ctrl+o".into()) },
     ]
 }
 
@@ -122,11 +133,130 @@ fn ranked(i: usize, n: usize) -> f32 {
 }
 
 // ===========================================================================
+// Queue command: a live view of the YouTube Music queue with skip-to / remove.
+// ===========================================================================
+
+/// One track in the current queue, as returned by the companion `get_queue`.
+struct QueueRow {
+    index: usize,
+    video_id: String,
+    title: String,
+    artist: String,
+    duration: Option<String>,
+    thumb: Option<String>,
+    current: bool,
+}
+
+/// The action menu on every queue row. First = default (Enter).
+fn queue_actions() -> Vec<Action> {
+    // skip_to / remove keep the launcher open (RefreshResults re-pulls the
+    // queue so the "▶ Now playing" marker follows). `opens_form` is set to make
+    // the host skip the optimistic hide - same trick as the search rows.
+    vec![
+        Action { id: "skip_to".into(), label: "Skip to".into(), hint: Some("play this track".into()), opens_form: true, shortcut: None },
+        Action { id: "remove".into(), label: "Remove from queue".into(), hint: None, opens_form: true, shortcut: Some("ctrl+d".into()) },
+        Action { id: "open".into(), label: "Open in browser".into(), hint: None, opens_form: false, shortcut: Some("ctrl+o".into()) },
+    ]
+}
+
+/// Maps a queue row to a launcher result. The now-playing track floats to the
+/// top with a badge; the rest keep queue order via descending relevance.
+///
+/// `salt` is a per-snapshot value baked into the id. The host records frecency
+/// on every activation (a skip_to counts) keyed by the full result id, and a
+/// single frecency bonus can dwarf the whole extension relevance band - so a
+/// stable id would let previously-skipped tracks bubble to the top and wreck
+/// the queue order. Salting the id per snapshot keeps it frecency-neutral; the
+/// salt sits before the JSON and `decode_meta` skips over it.
+fn queue_result(r: &QueueRow, n: usize, salt: u64) -> ExtensionResult {
+    let meta = SongMeta {
+        v: r.video_id.clone(),
+        a: r.artist.clone(),
+        al: String::new(),
+        d: r.duration.clone(),
+        t: r.thumb.clone(),
+        i: Some(r.index),
+    };
+    let relevance =
+        if r.current { 100.0 } else { 99.0 - (r.index as f32 / n.max(1) as f32) * 90.0 };
+    let badge = if r.current { Some("\u{25B6} Now playing".into()) } else { r.duration.clone() };
+    ExtensionResult {
+        id: format!("qitem:{}:{}", salt, serde_json::to_string(&meta).unwrap_or_default()),
+        title: r.title.clone(),
+        subtitle: if r.artist.is_empty() { None } else { Some(r.artist.clone()) },
+        relevance,
+        actions: queue_actions(),
+        icon: Some(icon()),
+        badge,
+    }
+}
+
+/// Asks the companion for the current queue. Reply shape: `{ "ok": true,
+/// "items": [{ "videoId", "title", "artist", "duration", "thumbnail",
+/// "index", "current" }], "selectedIndex" }`.
+fn companion_get_queue() -> Result<Vec<QueueRow>, String> {
+    let reply = guest::bus_call(json!({ "op": "get_queue" }), ACTION_TIMEOUT_MS)
+        .map_err(|e| e.to_string())?;
+    if !reply.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let msg = reply.get("error").and_then(Value::as_str).unwrap_or("companion error");
+        return Err(msg.to_string());
+    }
+    let items = reply.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut rows = Vec::new();
+    for (i, it) in items.iter().enumerate() {
+        let title = it.get("title").and_then(Value::as_str).unwrap_or("").to_string();
+        if title.is_empty() {
+            continue;
+        }
+        let index = it.get("index").and_then(Value::as_u64).map(|n| n as usize).unwrap_or(i);
+        rows.push(QueueRow {
+            index,
+            video_id: it.get("videoId").and_then(Value::as_str).unwrap_or("").to_string(),
+            title,
+            artist: it.get("artist").and_then(Value::as_str).unwrap_or("").to_string(),
+            duration: it.get("duration").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string),
+            thumb: it.get("thumbnail").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string),
+            current: it.get("current").and_then(Value::as_bool).unwrap_or(false),
+        });
+    }
+    Ok(rows)
+}
+
+/// Emits queue rows, optionally filtered by a substring the user typed.
+fn emit_queue(rows: &[QueueRow], term: &str) {
+    let t = term.trim().to_lowercase();
+    let n = rows.len();
+    // One salt per snapshot keeps the row ids frecency-neutral (see queue_result).
+    let salt = guest::now().unwrap_or(0);
+    let results: Vec<ExtensionResult> = rows
+        .iter()
+        .filter(|r| {
+            t.is_empty()
+                || r.title.to_lowercase().contains(&t)
+                || r.artist.to_lowercase().contains(&t)
+        })
+        .map(|r| queue_result(r, n, salt))
+        .collect();
+    if results.is_empty() {
+        emit_message("No matching tracks", "Nothing in the queue matches that");
+    } else {
+        let _ = guest::emit(results);
+    }
+}
+
+// ===========================================================================
 // search: instant tier. No cache - just a placeholder while `query` runs.
 // ===========================================================================
 
 #[plugin_fn]
 pub fn search(input: Json<SearchInput>) -> FnResult<Json<SearchOutput>> {
+    // The queue command (min_query_len = 0) has no instant tier - the async
+    // `query` round-trip populates it. Returning nothing here avoids a stray
+    // placeholder row lingering among the real queue results.
+    if input.0.command == "queue" {
+        return Ok(Json(SearchOutput::default()));
+    }
+
     let term = input.0.query.trim();
     if term.is_empty() {
         return Ok(Json(SearchOutput::default()));
@@ -151,6 +281,23 @@ pub fn search(input: Json<SearchInput>) -> FnResult<Json<SearchOutput>> {
 #[plugin_fn]
 pub fn query(input: Json<QueryInput>) -> FnResult<Json<QueryOutput>> {
     let term = input.0.query.trim().to_string();
+
+    // Queue command: pull the live queue (any typed term filters it client-side).
+    if input.0.command == "queue" {
+        match companion_get_queue() {
+            Ok(rows) if !rows.is_empty() => emit_queue(&rows, &term),
+            Ok(_) => emit_message("Queue is empty", "Play something in YouTube Music"),
+            Err(e) => {
+                let _ = guest::debug(&format!("get_queue failed: {e}"));
+                emit_message(
+                    "Firefox companion not connected",
+                    "Open music.youtube.com and load the companion add-on",
+                );
+            }
+        }
+        return Ok(Json(QueryOutput::default()));
+    }
+
     if term.is_empty() {
         return Ok(Json(QueryOutput::default()));
     }
@@ -242,6 +389,11 @@ pub fn activate(input: Json<ActivateInput>) -> FnResult<Json<ActivateOutput>> {
         ))));
     }
 
+    // Queue rows: skip_to / remove by index, or open in browser.
+    if id.starts_with("qitem:") {
+        return Ok(Json(activate_queue(id, action)));
+    }
+
     let Some(video_id) = decode_meta(id).map(|m| m.v).filter(|v| !v.is_empty()) else {
         return Ok(Json(ActivateOutput::default()));
     };
@@ -291,6 +443,45 @@ fn human_op(op: &str) -> &'static str {
         "queue_next" => "play next",
         "queue_last" => "add to queue",
         _ => "play",
+    }
+}
+
+/// Handles activation of a queue row: skip_to / remove_from_queue by index, or
+/// "Open in browser". Both mutations refresh the list so the marker follows.
+fn activate_queue(id: &str, action: &str) -> ActivateOutput {
+    let Some(meta) = decode_meta(id) else {
+        return ActivateOutput::default();
+    };
+
+    if action == "open" {
+        if meta.v.is_empty() {
+            return ActivateOutput::default();
+        }
+        return ActivateOutput::open(format!("https://music.youtube.com/watch?v={}", meta.v));
+    }
+
+    let Some(index) = meta.i else {
+        return ActivateOutput::toast("Missing queue position", ToastLevel::Error);
+    };
+    let (op, verb) = match action {
+        "remove" => ("remove_from_queue", "remove"),
+        _ => ("skip_to", "skip"),
+    };
+    match guest::bus_call(json!({ "op": op, "index": index }), ACTION_TIMEOUT_MS) {
+        Ok(reply) if reply.get("ok").and_then(Value::as_bool).unwrap_or(false) => {
+            let msg = if op == "remove_from_queue" { "Removed from queue" } else { "Skipping" };
+            ActivateOutput::toast(msg, ToastLevel::Success).and(ActivateEffect::RefreshResults {})
+        }
+        Ok(reply) => {
+            let err =
+                reply.get("error").and_then(Value::as_str).unwrap_or("companion refused the action");
+            let _ = guest::debug(&format!("{op} failed: {err}"));
+            ActivateOutput::toast(format!("Couldn't {verb}: {err}"), ToastLevel::Error)
+        }
+        Err(e) => {
+            let _ = guest::debug(&format!("{op} bus error: {e}"));
+            ActivateOutput::toast("Firefox companion not connected", ToastLevel::Error)
+        }
     }
 }
 

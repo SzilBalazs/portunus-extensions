@@ -24,6 +24,18 @@
         return api.action
           ? api.action(payload.op, String(payload.videoId || ""))
           : Promise.resolve({ ok: false, error: "actions unavailable" });
+      case "get_queue":
+        return api.bridge
+          ? api.bridge("get_queue", {})
+          : Promise.resolve({ ok: false, error: "queue unavailable" });
+      case "skip_to":
+        return api.bridge
+          ? api.bridge("skip_to", { index: Number(payload.index) })
+          : Promise.resolve({ ok: false, error: "queue unavailable" });
+      case "remove_from_queue":
+        return api.bridge
+          ? api.bridge("remove_from_queue", { index: Number(payload.index) })
+          : Promise.resolve({ ok: false, error: "queue unavailable" });
       default:
         return Promise.resolve({ ok: false, error: "unknown op: " + payload.op });
     }

@@ -54,7 +54,9 @@
     }
   });
 
-  async function callBridge(op, videoId) {
+  // Generic page-bridge RPC. `payload` fields (videoId, index, …) are merged
+  // into the request the bridge receives; the bridge dispatches on `op`.
+  async function callBridge(op, payload) {
     // Wait for the bridge, but don't hang forever if injection was blocked.
     const ready = await Promise.race([
       bridgeReady.then(() => true),
@@ -79,8 +81,8 @@
         LOG("callBridge: reply for", op, "id", id, result);
         resolve(result);
       });
-      LOG("callBridge: posting request", op, "id", id, "videoId", videoId);
-      window.postMessage({ [TAG]: "request", id, op, videoId }, location.origin);
+      LOG("callBridge: posting request", op, "id", id, payload);
+      window.postMessage({ [TAG]: "request", id, op, ...(payload || {}) }, location.origin);
     });
   }
 
@@ -89,10 +91,13 @@
     // All three (play_now / queue_next / queue_last) run through the page
     // bridge's store path. play_now inserts after the current track and jumps
     // to it in-tab — no navigation/reload, so the queue is preserved.
-    return await callBridge(op, videoId);
+    return await callBridge(op, { videoId });
   }
 
   injectBridge();
   window.__ytmCompanion = window.__ytmCompanion || {};
   window.__ytmCompanion.action = action;
+  // Generic bridge caller for queue ops (get_queue / skip_to / remove_from_queue),
+  // which live in the page context alongside the play/queue store path.
+  window.__ytmCompanion.bridge = callBridge;
 })();

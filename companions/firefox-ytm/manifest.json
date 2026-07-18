@@ -1,12 +1,15 @@
 {
   "manifest_version": 3,
   "name": "Portunus YTM companion",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Bridges Portunus's YouTube Music extension to your logged-in music.youtube.com tab: personalized search plus play-now / play-next / add-to-queue.",
   "browser_specific_settings": {
     "gecko": {
       "id": "ytm-portunus@example.org",
-      "strict_min_version": "115.0"
+      "strict_min_version": "115.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
     }
   },
   "permissions": ["nativeMessaging", "tabs"],
