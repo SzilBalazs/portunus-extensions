@@ -80,6 +80,7 @@ jobs:
           for k in ("kv", "clipboard", "open_url", "paste"):
               if p.get(k): rows.append(k)
           if p.get("spawn"): rows.append("**spawn (sandbox-breaking): " + ", ".join(sorted(p["spawn"])) + "**")
+          if p.get("bus"): rows.append("**bus (companion process channel)**")
           if any(s.get("type") == "secret" for s in m.get("settings", [])): rows.append("secrets (keyring)")
           perms = "; ".join(rows) if rows else "none - fully sandboxed"
           print(f"| `{m['name']}` | v{m['version']} | api {m['api']} | {perms} |")

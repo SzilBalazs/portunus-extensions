@@ -1,6 +1,6 @@
-api = 4
+api = 5
 name = "gh"
-version = "0.3.0"
+version = "0.3.1"
 description = "GitHub launcher - search repos/issues/PRs/code/users and browse your PRs, issues, repos, stars and notifications"
 author = "Portunus examples"
 homepage = "https://github.com"

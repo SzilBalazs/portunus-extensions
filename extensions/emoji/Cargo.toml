@@ -7,7 +7,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-portunus-ext-sdk = { git = "https://github.com/SzilBalazs/portunus", tag = "v0.3.0" }
+portunus-ext-sdk = { git = "https://github.com/SzilBalazs/portunus", tag = "v0.4.0" }
 serde_json = "1"
 
 [profile.release]

@@ -75,6 +75,7 @@ def consent_permissions(manifest: dict) -> dict:
         "open_url": bool(perms.get("open_url", False)),
         "paste": bool(perms.get("paste", False)),
         "spawn": sorted(perms.get("spawn", [])),
+        "bus": bool(perms.get("bus", False)),
         "has_secrets": any(s.get("type") == "secret" for s in manifest.get("settings", [])),
     }
 
