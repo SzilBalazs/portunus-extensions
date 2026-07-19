@@ -1,6 +1,6 @@
 api = 5
 name = "ytm"
-version = "0.2.0"
+version = "0.3.0"
 description = "Search YouTube Music and control playback - play now, play next, add to queue. Requires the Firefox companion (companions/firefox-ytm), which runs search and playback in your logged-in music.youtube.com tab."
 author = "Portunus examples"
 homepage = "https://music.youtube.com"
@@ -40,6 +40,16 @@ frecency = false
 # result set changes underneath the launcher - clear on requery so an
 # already-played row can't linger showing a stale "Now playing".
 volatile = true
+
+[[settings]]
+key = "max_results"
+type = "number"
+label = "Search results per query"
+description = "How many song matches to show. Fewer means fewer album-art fetches, so a lower value loads faster."
+default = 5
+min = 1
+max = 15
+step = 1
 
 [permissions]
 # Talk to the Firefox companion (personalized search + queue control).

@@ -67,11 +67,6 @@ struct SongMeta {
 }
 
 impl Song {
-    /// The row subtitle: "Artist • Album" (either part may be empty).
-    fn subtitle(&self) -> String {
-        join_meta(&[self.artist.as_str(), self.album.as_str()])
-    }
-
     fn meta(&self) -> SongMeta {
         SongMeta {
             v: self.video_id.clone(),
@@ -107,10 +102,12 @@ fn song_actions() -> Vec<Action> {
     ]
 }
 
-/// Maps a parsed song to a launcher result.
-fn song_result(s: &Song, relevance: f32) -> ExtensionResult {
-    let sub = s.subtitle();
-    let subtitle = if sub.is_empty() { None } else { Some(sub) };
+/// Maps a parsed song to a launcher result. `row_icon` is the resolved album
+/// art (cache/fetch) or the generic icon - same treatment as queue rows.
+fn song_result(s: &Song, relevance: f32, row_icon: portunus_ext_sdk::ResultIcon) -> ExtensionResult {
+    // Row subtitle is artist only - same as queue rows. Album still shows in
+    // the preview card.
+    let subtitle = if s.artist.is_empty() { None } else { Some(s.artist.clone()) };
     ExtensionResult {
         // Pack video id + metadata so activate/preview are self-contained.
         id: format!("song:{}", serde_json::to_string(&s.meta()).unwrap_or_default()),
@@ -118,7 +115,7 @@ fn song_result(s: &Song, relevance: f32) -> ExtensionResult {
         subtitle,
         relevance,
         actions: song_actions(),
-        icon: Some(icon()),
+        icon: Some(row_icon),
         badge: s.duration.clone(),
     }
 }
@@ -440,11 +437,62 @@ fn emit_message(title: &str, subtitle: &str) {
     }]);
 }
 
+/// Default search-row cap when the setting is unset.
+const DEFAULT_MAX_RESULTS: usize = 5;
+
+/// Max search rows to show, from the "Search results per query" range setting
+/// (clamped to 1..=MAX_SONGS). Fewer rows = fewer album-art fetches, so this
+/// doubles as the performance knob.
+fn max_results() -> usize {
+    guest::setting_num("max_results")
+        .ok()
+        .flatten()
+        .map(|n| n as usize)
+        .unwrap_or(DEFAULT_MAX_RESULTS)
+        .clamp(1, MAX_SONGS)
+}
+
+/// Emits search rows with album-art thumbnails, mirroring [`emit_queue`]: pass 1
+/// uses only cached art (no network, no flicker on a warm requery); pass 2 runs
+/// only if some row's art wasn't cached, fetching the misses (bounded) and
+/// re-emitting the same ids so art fills in.
 fn emit_songs(songs: &[Song]) {
+    let songs = &songs[..songs.len().min(max_results())];
     let n = songs.len();
-    let results: Vec<ExtensionResult> =
-        songs.iter().enumerate().map(|(i, s)| song_result(s, ranked(i, n))).collect();
-    let _ = guest::emit(results);
+
+    // Pass 1: cached art only.
+    let mut any_miss = false;
+    let first: Vec<ExtensionResult> = songs
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let ic = cached_icon(&s.video_id).unwrap_or_else(|| {
+                if !s.video_id.is_empty() && s.thumb_url.as_deref().is_some_and(|u| !u.is_empty()) {
+                    any_miss = true;
+                }
+                icon()
+            });
+            song_result(s, ranked(i, n), ic)
+        })
+        .collect();
+    let _ = guest::emit(first);
+
+    // Warm cache: single emit, no flash.
+    if !any_miss {
+        return;
+    }
+
+    // Pass 2: fetch the misses (bounded), re-emit with art (same ids).
+    let mut budget = ART_FETCH_BUDGET;
+    let with_art: Vec<ExtensionResult> = songs
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let ic = row_icon(&s.video_id, s.thumb_url.as_deref(), &mut budget);
+            song_result(s, ranked(i, n), ic)
+        })
+        .collect();
+    let _ = guest::emit(with_art);
 }
 
 /// Ask the companion to search. Reply shape: `{ "ok": true, "results": [
@@ -476,11 +524,6 @@ fn companion_search(term: &str) -> Result<Vec<Song>, String> {
         songs.push(Song { video_id: video_id.to_string(), title, artist, album, duration, thumb_url });
     }
     Ok(songs)
-}
-
-/// Joins non-empty metadata parts with " • ".
-fn join_meta(parts: &[&str]) -> String {
-    parts.iter().filter(|p| !p.trim().is_empty()).cloned().collect::<Vec<_>>().join(" \u{2022} ")
 }
 
 // ===========================================================================
