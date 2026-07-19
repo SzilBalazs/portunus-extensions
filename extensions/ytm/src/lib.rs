@@ -193,25 +193,29 @@ fn queue_result(r: &QueueRow, n: usize, row_icon: portunus_ext_sdk::ResultIcon) 
 /// the query snappy on a cold cache (each fetch is a blocking HTTP round-trip).
 const ART_FETCH_BUDGET: usize = 16;
 
+/// Album art from the KV cache, or None if not cached yet. No network.
+fn cached_icon(video_id: &str) -> Option<portunus_ext_sdk::ResultIcon> {
+    if video_id.is_empty() {
+        return None;
+    }
+    let v = guest::kv_read(&format!("art:{video_id}")).ok()??;
+    let (mime, b64) = v.split_once('\t')?;
+    Some(portunus_ext_sdk::ResultIcon { mime: mime.into(), data_base64: b64.into() })
+}
+
 /// Resolves a queue row's icon: KV cache first, then a bounded live fetch of a
 /// downsized thumbnail (cached for next time), else the generic YTM icon.
 fn row_icon(video_id: &str, thumb: Option<&str>, budget: &mut usize) -> portunus_ext_sdk::ResultIcon {
-    if video_id.is_empty() {
-        return icon();
+    if let Some(ic) = cached_icon(video_id) {
+        return ic;
     }
-    let key = format!("art:{video_id}");
-    if let Ok(Some(v)) = guest::kv_read(&key) {
-        if let Some((mime, b64)) = v.split_once('\t') {
-            return portunus_ext_sdk::ResultIcon { mime: mime.into(), data_base64: b64.into() };
-        }
-    }
-    if *budget == 0 {
+    if *budget == 0 || video_id.is_empty() {
         return icon();
     }
     if let Some(url) = thumb.filter(|s| !s.is_empty()) {
         if let Some((mime, b64)) = fetch_icon_b64(&small_thumb_url(url, 48)) {
             *budget -= 1;
-            let _ = guest::kv_write(&key, &format!("{mime}\t{b64}"));
+            let _ = guest::kv_write(&format!("art:{video_id}"), &format!("{mime}\t{b64}"));
             return portunus_ext_sdk::ResultIcon { mime, data_base64: b64 };
         }
     }
@@ -293,10 +297,12 @@ fn companion_get_queue() -> Result<Vec<QueueRow>, String> {
     Ok(rows)
 }
 
-/// Emits queue rows in two passes: first the whole list with the generic icon
-/// (instant), then the same rows re-emitted with album art (cache + a bounded
-/// live fetch). Both passes use the same ids (same salt), so the second replaces
-/// the first in place - the list shows immediately and art fills in after.
+/// Emits queue rows. Pass 1 uses only cached art (already-cached rows show real
+/// art immediately, uncached rows fall back to the generic icon) - so a warm
+/// requery never flashes generic-then-art. Pass 2 runs only when some row's art
+/// wasn't cached: it fetches the misses (bounded) and re-emits the same ids so
+/// art fills in. Cold first open: list is instant, art streams in; warm
+/// requery: a single emit, no flicker.
 fn emit_queue(rows: &[QueueRow], term: &str) {
     let t = term.trim().to_lowercase();
     let n = rows.len();
@@ -314,14 +320,30 @@ fn emit_queue(rows: &[QueueRow], term: &str) {
         return;
     }
 
-    // Pass 1: instant, generic icons.
-    let plain: Vec<ExtensionResult> =
-        visible.iter().map(|r| queue_result(r, n, icon())).collect();
-    let _ = guest::emit(plain);
+    // Pass 1: cached art only (no network). Track whether any row still needs a
+    // fetch (has a thumbnail but no cache entry yet).
+    let mut any_miss = false;
+    let first: Vec<ExtensionResult> = visible
+        .iter()
+        .map(|r| {
+            let ic = cached_icon(&r.video_id).unwrap_or_else(|| {
+                if !r.video_id.is_empty() && r.thumb.as_deref().is_some_and(|s| !s.is_empty()) {
+                    any_miss = true;
+                }
+                icon()
+            });
+            queue_result(r, n, ic)
+        })
+        .collect();
+    let _ = guest::emit(first);
 
-    // Pass 2: same rows with art (cache hits are free; misses fetch up to the
-    // budget). When the cache is warm this is near-instant and coalesces with
-    // pass 1; on a cold cache the list is already visible while art loads.
+    // Warm cache (nothing to fetch): single emit, no flash.
+    if !any_miss {
+        return;
+    }
+
+    // Pass 2: fetch the misses (bounded) and re-emit with art. Same ids, so
+    // the newly-fetched rows update in place.
     let mut budget = ART_FETCH_BUDGET;
     let with_art: Vec<ExtensionResult> = visible
         .iter()
@@ -559,7 +581,11 @@ fn activate_queue(id: &str, action: &str) -> ActivateOutput {
     match guest::bus_call(json!({ "op": op, "index": index }), ACTION_TIMEOUT_MS) {
         Ok(reply) if reply.get("ok").and_then(Value::as_bool).unwrap_or(false) => {
             let msg = if op == "remove_from_queue" { "Removed from queue" } else { "Skipping" };
-            ActivateOutput::toast(msg, ToastLevel::Success).and(ActivateEffect::RefreshResults {})
+            // KeepOpen so the launcher stays up (browse/skip several in a row);
+            // RefreshResults re-pulls the queue so the marker/membership updates.
+            ActivateOutput::toast(msg, ToastLevel::Success)
+                .and(ActivateEffect::RefreshResults {})
+                .and(ActivateEffect::KeepOpen {})
         }
         Ok(reply) => {
             let err =
