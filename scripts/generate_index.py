@@ -99,12 +99,33 @@ def icon_data_uri(ext_dir: Path, manifest: dict) -> str | None:
 
 
 def fetch_live_index(url: str) -> dict | None:
+    """Fetch the currently published index for immutability reuse.
+
+    Returns None ONLY when the index legitimately does not exist yet (404 -
+    first publish), where packing everything fresh is correct. Any other
+    failure (timeout, 5xx, connection reset, malformed JSON) is transient or
+    ambiguous: repacking fresh would silently rewrite already-published package
+    bytes and break every client's sha-pinned cache, so abort the publish
+    loudly instead of corrupting immutability.
+    """
     try:
         with urllib.request.urlopen(url, timeout=30) as resp:
             return json.load(resp)
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError) as e:
-        print(f"live index unavailable ({e}) - publishing fresh")
-        return None
+    except urllib.error.HTTPError as e:  # subclass of URLError - catch first
+        if e.code == 404:
+            print(f"no live index at {url} (404) - first publish, packing fresh")
+            return None
+        sys.exit(
+            f"live index fetch failed (HTTP {e.code}) - aborting to preserve "
+            f"immutability; re-run once {url} is reachable"
+        )
+    except (urllib.error.URLError, TimeoutError) as e:
+        sys.exit(
+            f"live index fetch failed ({e}) - aborting to preserve immutability; "
+            f"re-run once {url} is reachable"
+        )
+    except json.JSONDecodeError as e:
+        sys.exit(f"live index is not valid JSON ({e}) - fix or remove it before republishing")
 
 
 def main() -> None:
