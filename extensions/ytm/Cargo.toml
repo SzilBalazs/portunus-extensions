@@ -7,12 +7,12 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-# Default action shortcuts (`Action.shortcut`) ship in SDK v0.5.0 - the
-# marketplace CI builds against this tag. To build locally before it is
-# tagged, point the dep at a checkout with `--config`:
+# The `SelectFirst` activate effect ships in SDK v0.4.1 - the marketplace CI
+# builds against this tag. To build locally before it is tagged, point the dep
+# at a checkout with `--config`:
 #   cargo build --release --config \
 #     'patch."https://github.com/SzilBalazs/portunus".portunus-ext-sdk.path="../../../portunus/extension-sdk"'
-portunus-ext-sdk = { git = "https://github.com/SzilBalazs/portunus", tag = "v0.5.0" }
+portunus-ext-sdk = { git = "https://github.com/SzilBalazs/portunus", tag = "v0.4.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
