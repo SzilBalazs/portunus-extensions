@@ -35,6 +35,7 @@ fn icon() -> portunus_ext_sdk::ResultIcon {
 }
 
 /// A parsed song row from the companion. `video_id` is the watch id.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 struct Song {
     video_id: String,
     title: String,
@@ -222,8 +223,10 @@ fn row_icon(video_id: &str, thumb: Option<&str>, budget: &mut usize) -> portunus
 /// Rewrites an art URL to a small, fast-to-fetch variant, per host:
 /// - `i.ytimg.com/vi/<id>/<q>.jpg?...` (queue thumbs) -> `.../default.jpg`
 ///   (120x90, no signed query params).
-/// - `*.googleusercontent.com/...=w..-h..` (search art) -> a `px` square.
-/// Both stay well under the 32 KB icon cap. Unknown shapes pass through.
+/// - `*.googleusercontent.com/...=w..-h..` (search/playlist art) -> a `px` square.
+/// - anything else (e.g. `www.gstatic.com` built-in playlist covers, which take
+///   no size suffix) passes through unchanged.
+/// All stay well under the 32 KB icon cap.
 fn small_thumb_url(url: &str, px: u32) -> String {
     if url.contains("ytimg.com") {
         // Drop the filename + query and use the small unsigned `default.jpg`.
@@ -232,7 +235,11 @@ fn small_thumb_url(url: &str, px: u32) -> String {
         }
         return url.to_string();
     }
-    // googleusercontent carries a `=w..-h..` size suffix.
+    // Only googleusercontent understands the `=w..-h..` size suffix; appending
+    // it to other hosts (gstatic .png covers) produces a 404. Leave those be.
+    if !url.contains("googleusercontent.com") {
+        return url.to_string();
+    }
     match url.rfind('=') {
         Some(eq) => format!("{}=w{px}-h{px}-l90-rj", &url[..eq]),
         None => format!("{url}=w{px}-h{px}"),
@@ -353,15 +360,439 @@ fn emit_queue(rows: &[QueueRow], term: &str) {
 }
 
 // ===========================================================================
+// Playlists command: browse the library, drill into a playlist's tracks.
+// ===========================================================================
+
+// The companion caps each playlist fetch at 300 tracks; that full set is
+// cached and backs local filtering. A typed term searches all of them, even
+// though only PLAYLIST_DISPLAY_CAP rows are ever emitted.
+
+/// Max track rows actually emitted for a drill-in. Kept well under the host's
+/// 200-row and 512 KB emit ceilings (each row carries a couple KB of album
+/// art). Typing filters across all cached tracks, then the matches cap to this.
+const PLAYLIST_DISPLAY_CAP: usize = 150;
+
+/// One playlist card from the companion `get_playlists`.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+struct Playlist {
+    /// Browse id, e.g. `VLPLxxxx` / `VLLM` (liked). The `VL` prefix is stripped
+    /// for the public `/playlist?list=` URL.
+    browse_id: String,
+    title: String,
+    subtitle: String,
+    thumb: Option<String>,
+}
+
+/// Actions on a playlist card. Default (Enter) drills into the tracklist; the
+/// browser open is a secondary choice.
+fn playlist_actions() -> Vec<Action> {
+    // `open_tracks` drills in via a SetQuery + KeepOpen (see `activate`), so it
+    // keeps the launcher open - `opens_form` makes the host skip the optimistic
+    // hide, same trick as the other keep-open rows.
+    vec![
+        Action { id: "open_tracks".into(), label: "Show tracks".into(), hint: Some("browse this playlist".into()), opens_form: true, shortcut: None },
+        Action { id: "open".into(), label: "Open in browser".into(), hint: None, opens_form: false, shortcut: Some("ctrl+o".into()) },
+    ]
+}
+
+/// Maps a playlist to a launcher result. The id is `pl:<browseId>`; activating
+/// the default action re-queries this command with that string as the term,
+/// which the query handler recognises as a drill-in.
+fn playlist_result(p: &Playlist, relevance: f32, row_icon: portunus_ext_sdk::ResultIcon) -> ExtensionResult {
+    ExtensionResult {
+        id: format!("pl:{}", p.browse_id),
+        title: p.title.clone(),
+        subtitle: if p.subtitle.is_empty() { None } else { Some(p.subtitle.clone()) },
+        relevance,
+        actions: playlist_actions(),
+        icon: Some(row_icon),
+        badge: None,
+    }
+}
+
+/// Asks the companion for the library's playlists. Reply shape: `{ "ok": true,
+/// "playlists": [{ "browseId", "title", "subtitle", "thumbnail" }] }`.
+fn companion_get_playlists() -> Result<Vec<Playlist>, String> {
+    let reply = guest::bus_call(json!({ "op": "get_playlists" }), SEARCH_TIMEOUT_MS)
+        .map_err(|e| e.to_string())?;
+    if !reply.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let msg = reply.get("error").and_then(Value::as_str).unwrap_or("companion error");
+        return Err(msg.to_string());
+    }
+    let items = reply.get("playlists").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut out = Vec::new();
+    for it in &items {
+        let browse_id = it.get("browseId").and_then(Value::as_str).unwrap_or("").to_string();
+        let title = it.get("title").and_then(Value::as_str).unwrap_or("").to_string();
+        if browse_id.is_empty() || title.is_empty() {
+            continue;
+        }
+        out.push(Playlist {
+            browse_id,
+            title,
+            subtitle: it.get("subtitle").and_then(Value::as_str).unwrap_or("").to_string(),
+            thumb: it.get("thumbnail").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string),
+        });
+    }
+    Ok(out)
+}
+
+/// Asks the companion for one playlist's tracks. Reply shape: `{ "ok": true,
+/// "tracks": [ <same song shape as search> ] }`.
+fn companion_get_playlist_tracks(browse_id: &str) -> Result<Vec<Song>, String> {
+    let reply = guest::bus_call(
+        json!({ "op": "get_playlist_tracks", "browseId": browse_id }),
+        SEARCH_TIMEOUT_MS,
+    )
+    .map_err(|e| e.to_string())?;
+    if !reply.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let msg = reply.get("error").and_then(Value::as_str).unwrap_or("companion error");
+        return Err(msg.to_string());
+    }
+    let items = reply.get("tracks").and_then(Value::as_array).cloned().unwrap_or_default();
+    Ok(songs_from_items(&items))
+}
+
+/// KV key holding the current drill-in target: `"<browseId>\t<ts_ms>"`. Kept
+/// out of the query bar so the bar is a clean filter box. Short-lived: it's the
+/// current navigation, not a saved preference.
+const PLNAV_KEY: &str = "plnav";
+/// How long a drill-in stays "current" without interaction. Refreshed on every
+/// in-playlist query, so active filtering keeps it alive; re-entering the
+/// command after this window shows the playlist list again (not a stale drill-in).
+const PLNAV_TTL_MS: u64 = 20_000;
+
+/// The current drill-in browseId, if one is set and still fresh. A stale/absent
+/// entry reads as None (the caller then shows the playlist list).
+fn plnav_get() -> Option<String> {
+    let v = guest::kv_read(PLNAV_KEY).ok()??;
+    let (bid, ts) = v.split_once('\t')?;
+    let ts: u64 = ts.parse().ok()?;
+    let now = guest::now().unwrap_or(0);
+    (now.saturating_sub(ts) < PLNAV_TTL_MS).then(|| bid.to_string())
+}
+
+/// Records `browse_id` as the current drill-in (stamped now). Also called on
+/// each in-playlist query to refresh the freshness window.
+fn plnav_set(browse_id: &str) {
+    let now = guest::now().unwrap_or(0);
+    let _ = guest::kv_write(PLNAV_KEY, &format!("{browse_id}\t{now}"));
+}
+
+/// Clears the drill-in (back to the playlist list).
+fn plnav_clear() {
+    let _ = guest::kv_remove(PLNAV_KEY);
+}
+
+// Playlist caches (stale-while-revalidate). The library list and each opened
+// playlist's tracks are cached in KV so re-entering a seen playlist is instant.
+// On entry we still fetch from the companion and re-emit only if the data
+// changed — the cache serves the view, the fetch keeps it correct.
+
+/// KV key for the cached library playlist list.
+const PLISTS_KEY: &str = "plists";
+
+/// KV key for a cached tracklist, keyed by browseId so switching playlists is a
+/// fresh view (not a stale hit). Paging through continuations makes the fetch
+/// expensive, so the cache backs local filtering on every keystroke.
+fn pltracks_key(browse_id: &str) -> String {
+    format!("pltracks:{browse_id}")
+}
+
+/// How long a cached list/tracklist stays usable for display at all. Past this,
+/// we treat the cache as absent and fetch fresh before showing anything.
+const CACHE_TTL_MS: u64 = 600_000;
+
+/// Within this age we skip the companion revalidation entirely: consecutive
+/// keystrokes in one browsing session never re-hit the companion, while
+/// re-entering the command later (older cache) triggers one refresh.
+const REVALIDATE_MS: u64 = 5_000;
+
+/// Reads a `"<ts>\t<json>"` cache entry into `(value, ts_ms)`, or None if
+/// absent/unparseable. TTL is left to the caller.
+fn cache_read<T: serde::de::DeserializeOwned>(key: &str) -> Option<(T, u64)> {
+    let v = guest::kv_read(key).ok()??;
+    let (ts, json) = v.split_once('\t')?;
+    let ts: u64 = ts.parse().ok()?;
+    let val = serde_json::from_str::<T>(json).ok()?;
+    Some((val, ts))
+}
+
+/// Writes a cache entry stamped now.
+fn cache_write<T: Serialize>(key: &str, val: &T) {
+    let now = guest::now().unwrap_or(0);
+    if let Ok(json) = serde_json::to_string(val) {
+        let _ = guest::kv_write(key, &format!("{now}\t{json}"));
+    }
+}
+
+/// Age in ms of a cache timestamp relative to now (saturating).
+fn cache_age(ts: u64) -> u64 {
+    guest::now().unwrap_or(0).saturating_sub(ts)
+}
+
+/// The "back to playlists" row, pinned to the top of a drill-in. Activating it
+/// clears the drill-in and returns to the list (see `activate`). Relevance above
+/// any track's so it sorts first.
+fn back_row() -> ExtensionResult {
+    ExtensionResult {
+        id: "plback".into(),
+        title: "\u{25C0} All playlists".into(),
+        subtitle: Some("Back to your library".into()),
+        relevance: 200.0,
+        actions: vec![Action { id: "back".into(), label: "Back to playlists".into(), hint: None, opens_form: true, shortcut: None }],
+        icon: Some(icon()),
+        badge: None,
+    }
+}
+
+/// Handles the `playlists` command query. With a drill-in recorded in KV, emits
+/// that playlist's tracks (the typed term filters them) plus a back row;
+/// otherwise lists the library's playlists (the term filters the list). Both are
+/// stale-while-revalidate: a warm cache renders instantly, then the companion is
+/// asked for the current data and the view is re-emitted only if it changed.
+fn query_playlists(term: &str) {
+    if let Some(browse_id) = plnav_get() {
+        plnav_set(&browse_id); // refresh the freshness window on active use
+        query_playlist_tracks(&browse_id, term);
+        return;
+    }
+
+    // No (fresh) drill-in: clear any stale entry and show the playlist list.
+    plnav_clear();
+    query_playlist_list(term);
+}
+
+/// Rows for the instant `search` tier of the playlists command, built from the
+/// KV cache only (no companion call, no network — art is cached-only). Returns
+/// the current drill-in's tracks, else the library list; empty when the cache
+/// is cold or expired (the async `query` then shows the first-load spinner).
+fn playlists_instant_rows(term: &str) -> Vec<ExtensionResult> {
+    if let Some(browse_id) = plnav_get() {
+        if let Some((tracks, ts)) = cache_read::<Vec<Song>>(&pltracks_key(&browse_id)) {
+            if cache_age(ts) < CACHE_TTL_MS {
+                return playlist_track_rows(&tracks, term).0;
+            }
+        }
+        return Vec::new();
+    }
+    if let Some((pls, ts)) = cache_read::<Vec<Playlist>>(PLISTS_KEY) {
+        if !pls.is_empty() && cache_age(ts) < CACHE_TTL_MS {
+            return playlist_list_rows(&pls, term).0;
+        }
+    }
+    Vec::new()
+}
+
+/// Drill-in view: serve the cached tracklist instantly, then revalidate against
+/// the companion (skipped if the cache was refreshed within [`REVALIDATE_MS`],
+/// so mid-typing keystrokes never re-fetch). Re-emits only on a real change.
+fn query_playlist_tracks(browse_id: &str, term: &str) {
+    let cached: Option<(Vec<Song>, u64)> = cache_read(&pltracks_key(browse_id));
+    let mut shown = false;
+    if let Some((tracks, ts)) = &cached {
+        if cache_age(*ts) < CACHE_TTL_MS {
+            emit_playlist_tracks(tracks, term);
+            shown = true;
+            if cache_age(*ts) < REVALIDATE_MS {
+                return; // recently revalidated — pure local filter, no fetch
+            }
+        }
+    }
+
+    match companion_get_playlist_tracks(browse_id) {
+        Ok(fresh) => {
+            let changed = cached.as_ref().map_or(true, |(old, _)| old != &fresh);
+            cache_write(&pltracks_key(browse_id), &fresh);
+            if changed {
+                emit_playlist_tracks(&fresh, term);
+            }
+        }
+        Err(e) => {
+            let _ = guest::debug(&format!("get_playlist_tracks failed: {e}"));
+            if !shown {
+                let _ = guest::emit(vec![back_row(), info_result("Couldn't load playlist", &e)]);
+            }
+        }
+    }
+}
+
+/// Library list: serve the cached playlists instantly, then revalidate against
+/// the companion (same freshness rule as the tracklist). Re-emits only on a
+/// real change; a fetch error keeps the cached view on screen.
+fn query_playlist_list(term: &str) {
+    let cached: Option<(Vec<Playlist>, u64)> = cache_read(PLISTS_KEY);
+    let mut shown = false;
+    if let Some((pls, ts)) = &cached {
+        if !pls.is_empty() && cache_age(*ts) < CACHE_TTL_MS {
+            emit_playlists(pls, term);
+            shown = true;
+            if cache_age(*ts) < REVALIDATE_MS {
+                return;
+            }
+        }
+    }
+
+    match companion_get_playlists() {
+        Ok(fresh) if !fresh.is_empty() => {
+            let changed = cached.as_ref().map_or(true, |(old, _)| old != &fresh);
+            cache_write(PLISTS_KEY, &fresh);
+            if changed {
+                emit_playlists(&fresh, term);
+            }
+        }
+        Ok(_) => {
+            if !shown {
+                emit_message("No playlists", "Create one in YouTube Music");
+            }
+        }
+        Err(e) => {
+            let _ = guest::debug(&format!("get_playlists failed: {e}"));
+            if !shown {
+                emit_message(
+                    "Firefox companion not connected",
+                    "Open music.youtube.com and load the companion add-on",
+                );
+            }
+        }
+    }
+}
+
+/// Emits a drill-in view: the back row plus the playlist's tracks (filtered by
+/// `term`). Two-pass art like [`emit_queue`]; the back row rides along in both
+/// emits so it's present from the first frame and under `volatile` replacement.
+fn emit_playlist_tracks(tracks: &[Song], term: &str) {
+    // Pass 1: back row + tracks with cached art only (no network, no flicker).
+    let (first, any_miss) = playlist_track_rows(tracks, term);
+    let _ = guest::emit(first);
+    if !any_miss {
+        return;
+    }
+    // Pass 2: fetch the misses (bounded), re-emit with art (same ids).
+    let visible = visible_tracks(tracks, term);
+    let n = visible.len();
+    let mut budget = ART_FETCH_BUDGET;
+    let mut second = vec![back_row()];
+    second.extend(visible.iter().enumerate().map(|(i, s)| {
+        let ic = row_icon(&s.video_id, s.thumb_url.as_deref(), &mut budget);
+        song_result(s, ranked(i, n), ic)
+    }));
+    let _ = guest::emit(second);
+}
+
+/// The tracks visible for `term` (case-insensitive title/artist match). Filters
+/// across the whole cached tracklist, then caps the matches to the emit ceiling.
+fn visible_tracks<'a>(tracks: &'a [Song], term: &str) -> Vec<&'a Song> {
+    let t = term.trim().to_lowercase();
+    tracks
+        .iter()
+        .filter(|s| {
+            t.is_empty()
+                || s.title.to_lowercase().contains(&t)
+                || s.artist.to_lowercase().contains(&t)
+        })
+        .take(PLAYLIST_DISPLAY_CAP)
+        .collect()
+}
+
+/// Builds the drill-in rows (back row + tracks) using cached art only. Returns
+/// the rows and whether any track has art still to fetch. Shared by the instant
+/// `search` tier (which stops here, no network) and `emit_playlist_tracks`.
+fn playlist_track_rows(tracks: &[Song], term: &str) -> (Vec<ExtensionResult>, bool) {
+    let visible = visible_tracks(tracks, term);
+    if visible.is_empty() {
+        let msg = if tracks.is_empty() { "Empty playlist" } else { "No matching tracks" };
+        let sub = if tracks.is_empty() { "This playlist has no tracks" } else { "Nothing here matches that" };
+        return (vec![back_row(), info_result(msg, sub)], false);
+    }
+    let n = visible.len();
+    let mut any_miss = false;
+    let mut rows = vec![back_row()];
+    rows.extend(visible.iter().enumerate().map(|(i, s)| {
+        let ic = cached_icon(&s.video_id).unwrap_or_else(|| {
+            if !s.video_id.is_empty() && s.thumb_url.as_deref().is_some_and(|u| !u.is_empty()) {
+                any_miss = true;
+            }
+            icon()
+        });
+        song_result(s, ranked(i, n), ic)
+    }));
+    (rows, any_miss)
+}
+
+/// Emits playlist rows, mirroring [`emit_queue`]'s two-pass art handling: pass 1
+/// cached-only (no flicker on a warm requery), pass 2 fetches the misses.
+fn emit_playlists(pls: &[Playlist], term: &str) {
+    // Pass 1: cached art only.
+    let (first, any_miss) = playlist_list_rows(pls, term);
+    let _ = guest::emit(first);
+    if !any_miss {
+        return;
+    }
+    // Pass 2: fetch the misses (bounded), re-emit with art (same ids).
+    let visible = visible_playlists(pls, term);
+    let n = visible.len();
+    let mut budget = ART_FETCH_BUDGET;
+    let with_art: Vec<ExtensionResult> = visible
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let ic = row_icon(&p.browse_id, p.thumb.as_deref(), &mut budget);
+            playlist_result(p, ranked(i, n), ic)
+        })
+        .collect();
+    let _ = guest::emit(with_art);
+}
+
+/// The playlists visible for `term` (case-insensitive title match).
+fn visible_playlists<'a>(pls: &'a [Playlist], term: &str) -> Vec<&'a Playlist> {
+    let t = term.trim().to_lowercase();
+    pls.iter().filter(|p| t.is_empty() || p.title.to_lowercase().contains(&t)).collect()
+}
+
+/// Builds the library-list rows using cached art only. Returns the rows and
+/// whether any card has art still to fetch. Shared by the instant `search` tier
+/// and `emit_playlists`.
+fn playlist_list_rows(pls: &[Playlist], term: &str) -> (Vec<ExtensionResult>, bool) {
+    let visible = visible_playlists(pls, term);
+    if visible.is_empty() {
+        return (vec![info_result("No matching playlists", "Nothing in your library matches that")], false);
+    }
+    let n = visible.len();
+    let mut any_miss = false;
+    let rows: Vec<ExtensionResult> = visible
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let ic = cached_icon(&p.browse_id).unwrap_or_else(|| {
+                if p.thumb.as_deref().is_some_and(|s| !s.is_empty()) {
+                    any_miss = true;
+                }
+                icon()
+            });
+            playlist_result(p, ranked(i, n), ic)
+        })
+        .collect();
+    (rows, any_miss)
+}
+
+// ===========================================================================
 // search: instant tier. No cache - just a placeholder while `query` runs.
 // ===========================================================================
 
 #[plugin_fn]
 pub fn search(input: Json<SearchInput>) -> FnResult<Json<SearchOutput>> {
-    // The queue command (min_query_len = 0) has no instant tier - the async
-    // `query` round-trip populates it. Returning nothing here avoids a stray
-    // placeholder row lingering among the real queue results.
-    if input.0.command == "queue" {
+    // The playlists command fills this instant tier from the KV cache so a
+    // warm view (list or an opened tracklist) paints with no loading spinner
+    // between keystrokes; the async `query` then revalidates and adds art.
+    if input.0.command == "playlists" {
+        return Ok(Json(SearchOutput { results: playlists_instant_rows(&input.0.query) }));
+    }
+
+    // The queue command (min_query_len = 0) has no instant cache; it's populated
+    // by the async `query` round-trip. Returning nothing here avoids a stray
+    // placeholder row lingering among its real results.
+    if input.0.command != "search" {
         return Ok(Json(SearchOutput::default()));
     }
 
@@ -406,11 +837,22 @@ pub fn query(input: Json<QueryInput>) -> FnResult<Json<QueryOutput>> {
         return Ok(Json(QueryOutput::default()));
     }
 
+    // Library command: the playlist list, or (with a "pl:<browseId>" term set by
+    // the drill-in) that playlist's tracks.
+    if input.0.command == "playlists" {
+        query_playlists(&term);
+        return Ok(Json(QueryOutput::default()));
+    }
+
     if term.is_empty() {
         return Ok(Json(QueryOutput::default()));
     }
 
-    match companion_search(&term) {
+    let songs = companion_search(&term).map(|mut s| {
+        s.truncate(max_results());
+        s
+    });
+    match songs {
         Ok(songs) if !songs.is_empty() => emit_songs(&songs),
         Ok(_) => emit_message("No songs found", "Try a different search"),
         Err(e) => {
@@ -424,9 +866,11 @@ pub fn query(input: Json<QueryInput>) -> FnResult<Json<QueryOutput>> {
     Ok(Json(QueryOutput::default()))
 }
 
-/// Emits a single informational row (no actions).
-fn emit_message(title: &str, subtitle: &str) {
-    let _ = guest::emit(vec![ExtensionResult {
+/// A single informational row (no actions). Built separately from emitting so a
+/// caller can bundle it with other rows in one `emit` (needed under `volatile`,
+/// where each emit replaces the whole set).
+fn info_result(title: &str, subtitle: &str) -> ExtensionResult {
+    ExtensionResult {
         id: "msg".into(),
         title: title.into(),
         subtitle: Some(subtitle.into()),
@@ -434,7 +878,12 @@ fn emit_message(title: &str, subtitle: &str) {
         actions: Vec::new(),
         icon: Some(icon()),
         badge: None,
-    }]);
+    }
+}
+
+/// Emits a single informational row (no actions).
+fn emit_message(title: &str, subtitle: &str) {
+    let _ = guest::emit(vec![info_result(title, subtitle)]);
 }
 
 /// Default search-row cap when the setting is unset.
@@ -452,12 +901,12 @@ fn max_results() -> usize {
         .clamp(1, MAX_SONGS)
 }
 
-/// Emits search rows with album-art thumbnails, mirroring [`emit_queue`]: pass 1
+/// Emits song rows with album-art thumbnails, mirroring [`emit_queue`]: pass 1
 /// uses only cached art (no network, no flicker on a warm requery); pass 2 runs
 /// only if some row's art wasn't cached, fetching the misses (bounded) and
-/// re-emitting the same ids so art fills in.
+/// re-emitting the same ids so art fills in. Callers pass an already-capped
+/// slice (search caps to `max_results`; the playlist drill-in to a larger cap).
 fn emit_songs(songs: &[Song]) {
-    let songs = &songs[..songs.len().min(max_results())];
     let n = songs.len();
 
     // Pass 1: cached art only.
@@ -505,8 +954,15 @@ fn companion_search(term: &str) -> Result<Vec<Song>, String> {
         return Err(msg.to_string());
     }
     let items = reply.get("results").and_then(Value::as_array).cloned().unwrap_or_default();
+    Ok(songs_from_items(&items))
+}
+
+/// Parses companion song objects (`{ videoId, title, artist, album, duration,
+/// thumbnail }`) into [`Song`]s. Shared by search and playlist-track parsing -
+/// the companion returns the same row shape for both.
+fn songs_from_items(items: &[Value]) -> Vec<Song> {
     let mut songs = Vec::new();
-    for it in items.iter().take(MAX_SONGS) {
+    for it in items {
         let Some(video_id) = it.get("videoId").and_then(Value::as_str).filter(|s| !s.is_empty())
         else {
             continue;
@@ -523,7 +979,7 @@ fn companion_search(term: &str) -> Result<Vec<Song>, String> {
             it.get("thumbnail").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
         songs.push(Song { video_id: video_id.to_string(), title, artist, album, duration, thumb_url });
     }
-    Ok(songs)
+    songs
 }
 
 // ===========================================================================
@@ -546,6 +1002,38 @@ pub fn activate(input: Json<ActivateInput>) -> FnResult<Json<ActivateOutput>> {
     // Queue rows: skip_to / remove by index, or open in browser.
     if id.starts_with("qitem:") {
         return Ok(Json(activate_queue(id, action)));
+    }
+
+    // The "back to playlists" row: clear the drill-in and show the list again.
+    // Empty the filter box and requery (KeepOpen; SetQuery alone would hide).
+    if id == "plback" {
+        plnav_clear();
+        return Ok(Json(
+            ActivateOutput::set_query(String::new())
+                .and(ActivateEffect::SelectFirst {})
+                .and(ActivateEffect::KeepOpen {}),
+        ));
+    }
+
+    // Playlist cards: drill into the tracklist, or open in the browser.
+    if let Some(browse_id) = id.strip_prefix("pl:") {
+        if action == "open" {
+            // The public playlist URL wants the raw list id (browse id sans "VL").
+            let list = browse_id.strip_prefix("VL").unwrap_or(browse_id);
+            return Ok(Json(ActivateOutput::open(format!(
+                "https://music.youtube.com/playlist?list={list}"
+            ))));
+        }
+        // Drill in: record the target in KV (not the query bar) and clear the
+        // filter box. The requery finds the fresh drill-in and emits the
+        // playlist's tracks. KeepOpen so the launcher stays up (SetQuery alone
+        // defaults to hide).
+        plnav_set(browse_id);
+        return Ok(Json(
+            ActivateOutput::set_query(String::new())
+                .and(ActivateEffect::SelectFirst {})
+                .and(ActivateEffect::KeepOpen {}),
+        ));
     }
 
     let Some(video_id) = decode_meta(id).map(|m| m.v).filter(|v| !v.is_empty()) else {

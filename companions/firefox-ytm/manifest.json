@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Portunus YTM companion",
-  "version": "0.1.1",
-  "description": "Bridges Portunus's YouTube Music extension to your logged-in music.youtube.com tab: personalized search plus play-now / play-next / add-to-queue.",
+  "version": "0.2.0",
+  "description": "Bridges Portunus's YouTube Music extension to your logged-in music.youtube.com tab: personalized search, live queue control, and playlist/library browsing.",
   "browser_specific_settings": {
     "gecko": {
       "id": "ytm-portunus@example.org",
@@ -20,7 +20,7 @@
   "content_scripts": [
     {
       "matches": ["https://music.youtube.com/*"],
-      "js": ["content/search.js", "content/actions.js", "content/router.js"],
+      "js": ["content/search.js", "content/library.js", "content/actions.js", "content/router.js"],
       "run_at": "document_idle"
     }
   ],

@@ -1,6 +1,6 @@
 api = 5
 name = "ytm"
-version = "0.3.0"
+version = "0.4.0"
 description = "Search YouTube Music and control playback - play now, play next, add to queue. Requires the Firefox companion (companions/firefox-ytm), which runs search and playback in your logged-in music.youtube.com tab."
 author = "Portunus examples"
 homepage = "https://music.youtube.com"
@@ -41,6 +41,29 @@ frecency = false
 # already-played row can't linger showing a stale "Now playing".
 volatile = true
 
+# Library view: lists your playlists; open one to drill into its tracks.
+# min_query_len = 0 so it populates on entry with no typing. Opening a playlist
+# records the drill-in target in the extension's KV (not the query bar), so the
+# bar stays a clean filter box - typing filters the list, or the open playlist's
+# tracks. A "back" row returns to the list.
+[[commands]]
+name = "playlists"
+title = "YT Music Library"
+description = "Browse your playlists - open one to see its tracks"
+mode = "scope"
+keywords = ["playlist", "playlists", "library", "lib"]
+min_query_len = 0
+chip = "YT Library"
+icon = "icon.b64"
+placeholder = "Filter playlists…"
+# Playlist order (and, in the drill-in, track order) is intrinsic - opt out of
+# frecency so a frequently-opened playlist or track never floats out of place.
+frecency = false
+# The result set swaps wholesale between the playlist list and a playlist's
+# tracks (different ids), so replace per batch instead of merging - otherwise
+# the two lists would stack on the drill-in requery.
+volatile = true
+
 [[settings]]
 key = "max_results"
 type = "number"
@@ -60,7 +83,7 @@ kv = true
 # Album-art hosts, fetched on demand for the selection preview and queue-row
 # icons. Search results use lh3/yt3; queue thumbnails come from i.ytimg.com.
 # Search and playback go through the companion, not the network.
-network = ["lh3.googleusercontent.com", "yt3.googleusercontent.com", "i.ytimg.com"]
+network = ["lh3.googleusercontent.com", "yt3.googleusercontent.com", "i.ytimg.com", "www.gstatic.com"]
 # "Open in browser" action + the web-search placeholder.
 open_url = true
 

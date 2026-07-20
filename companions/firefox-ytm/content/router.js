@@ -36,6 +36,14 @@
         return api.bridge
           ? api.bridge("remove_from_queue", { index: Number(payload.index) })
           : Promise.resolve({ ok: false, error: "queue unavailable" });
+      case "get_playlists":
+        return api.getPlaylists
+          ? api.getPlaylists()
+          : Promise.resolve({ ok: false, error: "library unavailable" });
+      case "get_playlist_tracks":
+        return api.getPlaylistTracks
+          ? api.getPlaylistTracks(String(payload.browseId || ""))
+          : Promise.resolve({ ok: false, error: "library unavailable" });
       default:
         return Promise.resolve({ ok: false, error: "unknown op: " + payload.op });
     }

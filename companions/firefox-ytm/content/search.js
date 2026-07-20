@@ -9,7 +9,6 @@
 
 (() => {
   const ORIGIN = "https://music.youtube.com";
-  const ENDPOINT = ORIGIN + "/youtubei/v1/search?prettyPrint=false";
   const SONGS_FILTER = "EgWKAQIIAWoKEAoQAxAEEAkQBQ%3D%3D";
   const CLIENT_VERSION_FALLBACK = "1.20240101.00.00";
   const MAX_SONGS = 15;
@@ -47,8 +46,14 @@
     return `SAPISIDHASH ${ts}_${hash}`;
   }
 
-  async function search(query) {
-    if (!query) return { ok: true, results: [] };
+  // Generic authenticated InnerTube POST. Shares the tab's cookie jar +
+  // SAPISIDHASH auth — exactly what music.youtube.com sends itself — so it works
+  // with the user's own session. `path` is the endpoint name ("search",
+  // "browse", …); `body` is merged onto the standard client context. Returns the
+  // parsed JSON, or throws on network / non-200 / parse failure. Shared by the
+  // sturdy read paths (search + library browse); the fragile store code stays in
+  // actions.js/page-bridge.js.
+  async function innertube(path, body) {
     const headers = {
       "Content-Type": "application/json",
       "X-Goog-AuthUser": "0",
@@ -57,30 +62,28 @@
     const auth = await sapisidHash();
     if (auth) headers["Authorization"] = auth;
 
-    const body = {
+    const full = {
       context: { client: { clientName: "WEB_REMIX", clientVersion: clientVersion() } },
-      query,
-      params: SONGS_FILTER,
+      ...body,
     };
+    const url = ORIGIN + "/youtubei/v1/" + path + "?prettyPrint=false";
+    const resp = await fetch(url, {
+      method: "POST",
+      credentials: "include",
+      headers,
+      body: JSON.stringify(full),
+    });
+    if (!resp.ok) throw new Error("innertube status " + resp.status);
+    return await resp.json();
+  }
 
-    let resp;
-    try {
-      resp = await fetch(ENDPOINT, {
-        method: "POST",
-        credentials: "include",
-        headers,
-        body: JSON.stringify(body),
-      });
-    } catch (e) {
-      return { ok: false, error: "search fetch failed: " + (e && e.message) };
-    }
-    if (!resp.ok) return { ok: false, error: "innertube status " + resp.status };
-
+  async function search(query) {
+    if (!query) return { ok: true, results: [] };
     let json;
     try {
-      json = await resp.json();
+      json = await innertube("search", { query, params: SONGS_FILTER });
     } catch (e) {
-      return { ok: false, error: "innertube json parse failed" };
+      return { ok: false, error: "search failed: " + (e && e.message) };
     }
     return { ok: true, results: parseSongs(json) };
   }
@@ -134,7 +137,14 @@
     // Column 1 → "Song • Artist • Album • 3:45"-ish runs.
     const metaRuns = flexRuns(flex[1]).map(r => r.text).filter(Boolean);
     const isDuration = t => /^\d{1,2}(:\d{2})+$/.test(t.trim());
-    const duration = metaRuns.find(isDuration) || "";
+    // Playlist rows carry the duration in a fixed column, not the flex meta;
+    // fall back to it so playlist tracks still get a duration badge.
+    const fixedRuns =
+      mrlir?.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer?.text?.runs;
+    const fixedDuration = Array.isArray(fixedRuns)
+      ? (fixedRuns.map(r => r.text).find(t => t && isDuration(t)) || "")
+      : "";
+    const duration = metaRuns.find(isDuration) || fixedDuration;
     const parts = metaRuns.filter(t => t.trim() && t !== " • " && !isDuration(t));
     // A leading content-type token ("Song"/"Video"/…) appears on the top-result
     // card but not on song rows — drop it only when it really is a type word,
@@ -158,4 +168,9 @@
 
   window.__ytmCompanion = window.__ytmCompanion || {};
   window.__ytmCompanion.search = search;
+  // Shared by library.js: the authenticated InnerTube caller and the row parser
+  // for musicResponsiveListItemRenderer (playlist tracks use the same renderer
+  // as search rows), so browse code reuses this module's auth + parsing.
+  window.__ytmCompanion.innertube = innertube;
+  window.__ytmCompanion.parseListItem = parseRow;
 })();
