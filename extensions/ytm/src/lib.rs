@@ -473,12 +473,6 @@ fn pltracks_key(browse_id: &str) -> String {
     format!("pltracks:{browse_id}")
 }
 
-/// Max cache age still surfaced in *root* search (the "show at root" toggles).
-/// The library scope itself is pure stale-while-revalidate — it always paints
-/// the cache, however old, then revalidates — so this bound only limits the
-/// root discovery surface, where a very stale hit would be more surprising.
-const CACHE_TTL_MS: u64 = 600_000;
-
 /// Within this age we skip the companion revalidation entirely: consecutive
 /// keystrokes in one browsing session never re-hit the companion, while
 /// re-entering the command later (older cache) triggers one refresh.
@@ -554,16 +548,17 @@ fn root_playlist_rows(term: &str) -> Vec<ExtensionResult> {
     let mut rows = Vec::new();
 
     if setting_flag("search_playlists_at_root") {
-        if let Some((pls, ts)) = cache_read::<Vec<Playlist>>(PLISTS_KEY) {
-            if cache_age(ts) < CACHE_TTL_MS {
-                let mut visible = visible_playlists(&pls, t);
-                visible.truncate(root_cap("max_playlist_rows_at_root"));
-                let n = visible.len();
-                rows.extend(visible.iter().enumerate().map(|(i, p)| {
-                    let ic = cached_icon(&p.browse_id).unwrap_or_else(icon);
-                    playlist_result(p, ranked(i, n), ic)
-                }));
-            }
+        // Serve the cached list regardless of age. Entries persist until the
+        // library scope is opened and revalidated (which overwrites the list and
+        // prunes orphaned tracklists) — no TTL expiry.
+        if let Some((pls, _ts)) = cache_read::<Vec<Playlist>>(PLISTS_KEY) {
+            let mut visible = visible_playlists(&pls, t);
+            visible.truncate(root_cap("max_playlist_rows_at_root"));
+            let n = visible.len();
+            rows.extend(visible.iter().enumerate().map(|(i, p)| {
+                let ic = cached_icon(&p.browse_id).unwrap_or_else(icon);
+                playlist_result(p, ranked(i, n), ic)
+            }));
         }
     }
 
@@ -575,11 +570,10 @@ fn root_playlist_rows(term: &str) -> Vec<ExtensionResult> {
         let mut seen = std::collections::HashSet::new();
         let mut tracks: Vec<Song> = Vec::new();
         if let Ok(keys) = guest::kv_keys("pltracks:") {
+            // No age gate: a cached tracklist stays searchable until its playlist
+            // is opened+refreshed, or removed from the library (pruned then).
             'outer: for key in keys {
-                let Some((cached, ts)) = cache_read::<Vec<Song>>(&key) else { continue };
-                if cache_age(ts) >= CACHE_TTL_MS {
-                    continue;
-                }
+                let Some((cached, _ts)) = cache_read::<Vec<Song>>(&key) else { continue };
                 for s in visible_tracks(&cached, t) {
                     if !s.video_id.is_empty() && seen.insert(s.video_id.clone()) {
                         tracks.push(s.clone());
@@ -677,6 +671,10 @@ fn query_playlist_list(term: &str) {
         Ok(fresh) if !fresh.is_empty() => {
             let changed = cached.as_ref().map_or(true, |(old, _)| old != &fresh);
             cache_write(PLISTS_KEY, &fresh);
+            // A library refresh is the authoritative signal that a playlist is
+            // gone: drop its cached tracklist so its tracks stop surfacing in
+            // root search (which now serves cached rows regardless of age).
+            prune_orphan_tracklists(&fresh);
             // Stale-while-revalidate: any cache above was already painted, so
             // re-emit only when the fresh data differs. `!shown` covers the
             // cold-cache case (nothing painted yet), where we must emit.
@@ -697,6 +695,24 @@ fn query_playlist_list(term: &str) {
                     "Open music.youtube.com and load the companion add-on",
                 );
             }
+        }
+    }
+}
+
+/// Drops cached tracklists (`pltracks:<browseId>`) for playlists no longer in
+/// the freshly-fetched library. Called after a library-list revalidation — the
+/// one authoritative moment a removed playlist is detected. Without it, root
+/// search (age-gate removed) would keep surfacing a deleted playlist's tracks
+/// forever. Only the tracklist is purged; shared track art (`art:<videoId>`) is
+/// left to the KV quota's own eviction.
+fn prune_orphan_tracklists(fresh: &[Playlist]) {
+    let live: std::collections::HashSet<&str> =
+        fresh.iter().map(|p| p.browse_id.as_str()).collect();
+    let Ok(keys) = guest::kv_keys("pltracks:") else { return };
+    for key in keys {
+        let Some(browse_id) = key.strip_prefix("pltracks:") else { continue };
+        if !live.contains(browse_id) {
+            let _ = guest::kv_remove(&key);
         }
     }
 }
