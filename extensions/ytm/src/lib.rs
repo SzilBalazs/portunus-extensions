@@ -473,8 +473,10 @@ fn pltracks_key(browse_id: &str) -> String {
     format!("pltracks:{browse_id}")
 }
 
-/// How long a cached list/tracklist stays usable for display at all. Past this,
-/// we treat the cache as absent and fetch fresh before showing anything.
+/// Max cache age still surfaced in *root* search (the "show at root" toggles).
+/// The library scope itself is pure stale-while-revalidate — it always paints
+/// the cache, however old, then revalidates — so this bound only limits the
+/// root discovery surface, where a very stale hit would be more surprising.
 const CACHE_TTL_MS: u64 = 600_000;
 
 /// Within this age we skip the companion revalidation entirely: consecutive
@@ -521,19 +523,18 @@ fn query_playlists(data: Option<&str>, term: &str) {
 /// Rows for the instant `search` tier of an entered playlists scope, built from
 /// the KV cache only (no companion call, no network — art is cached-only).
 /// `data = Some(browseId)` returns that playlist's tracks, `None` the library
-/// list; empty when the cache is cold or expired (the async `query` then shows
-/// the first-load spinner).
+/// list; empty only when the cache is cold (never seen). Any cache, however
+/// old, is painted here — the async `query` then revalidates and re-emits if it
+/// changed. A cold cache shows the first-load spinner until `query` returns.
 fn playlists_instant_rows(data: Option<&str>, term: &str) -> Vec<ExtensionResult> {
     if let Some(browse_id) = data {
-        if let Some((tracks, ts)) = cache_read::<Vec<Song>>(&pltracks_key(browse_id)) {
-            if cache_age(ts) < CACHE_TTL_MS {
-                return playlist_track_rows(&tracks, term).0;
-            }
+        if let Some((tracks, _ts)) = cache_read::<Vec<Song>>(&pltracks_key(browse_id)) {
+            return playlist_track_rows(&tracks, term).0;
         }
         return Vec::new();
     }
-    if let Some((pls, ts)) = cache_read::<Vec<Playlist>>(PLISTS_KEY) {
-        if !pls.is_empty() && cache_age(ts) < CACHE_TTL_MS {
+    if let Some((pls, _ts)) = cache_read::<Vec<Playlist>>(PLISTS_KEY) {
+        if !pls.is_empty() {
             return playlist_list_rows(&pls, term).0;
         }
     }
@@ -629,12 +630,10 @@ fn query_playlist_tracks(browse_id: &str, term: &str) {
     let cached: Option<(Vec<Song>, u64)> = cache_read(&pltracks_key(browse_id));
     let mut shown = false;
     if let Some((tracks, ts)) = &cached {
-        if cache_age(*ts) < CACHE_TTL_MS {
-            emit_playlist_tracks(tracks, term);
-            shown = true;
-            if cache_age(*ts) < REVALIDATE_MS {
-                return; // recently revalidated — pure local filter, no fetch
-            }
+        emit_playlist_tracks(tracks, term);
+        shown = true;
+        if cache_age(*ts) < REVALIDATE_MS {
+            return; // recently revalidated — pure local filter, no fetch
         }
     }
 
@@ -642,7 +641,10 @@ fn query_playlist_tracks(browse_id: &str, term: &str) {
         Ok(fresh) => {
             let changed = cached.as_ref().map_or(true, |(old, _)| old != &fresh);
             cache_write(&pltracks_key(browse_id), &fresh);
-            if changed {
+            // Stale-while-revalidate: any cache above was already painted, so
+            // re-emit only when the fresh data differs. `!shown` covers the
+            // cold-cache case (nothing painted yet), where we must emit.
+            if changed || !shown {
                 emit_playlist_tracks(&fresh, term);
             }
         }
@@ -662,7 +664,7 @@ fn query_playlist_list(term: &str) {
     let cached: Option<(Vec<Playlist>, u64)> = cache_read(PLISTS_KEY);
     let mut shown = false;
     if let Some((pls, ts)) = &cached {
-        if !pls.is_empty() && cache_age(*ts) < CACHE_TTL_MS {
+        if !pls.is_empty() {
             emit_playlists(pls, term);
             shown = true;
             if cache_age(*ts) < REVALIDATE_MS {
@@ -675,7 +677,10 @@ fn query_playlist_list(term: &str) {
         Ok(fresh) if !fresh.is_empty() => {
             let changed = cached.as_ref().map_or(true, |(old, _)| old != &fresh);
             cache_write(PLISTS_KEY, &fresh);
-            if changed {
+            // Stale-while-revalidate: any cache above was already painted, so
+            // re-emit only when the fresh data differs. `!shown` covers the
+            // cold-cache case (nothing painted yet), where we must emit.
+            if changed || !shown {
                 emit_playlists(&fresh, term);
             }
         }
