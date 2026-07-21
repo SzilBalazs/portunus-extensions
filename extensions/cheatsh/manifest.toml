@@ -1,6 +1,6 @@
-api = 5
+api = 6
 name = "cheatsh"
-version = "0.3.1"
+version = "0.4.0"
 description = "Look up command cheat sheets from cheat.sh"
 author = "Portunus examples"
 kinds = ["ext-cheatsh"]

@@ -47,12 +47,13 @@ const TONED: &[&str] = &["thumbs up", "folded hands"];
 
 fn actions() -> Vec<Action> {
     vec![
-        Action { id: "copy".into(), label: "Copy emoji".into(), hint: None, opens_form: false },
+        Action { id: "copy".into(), label: "Copy emoji".into(), hint: None, opens_form: false, shortcut: None },
         Action {
             id: "copy-name".into(),
             label: "Copy name".into(),
             hint: Some("as :shortcode: text".into()),
             opens_form: false,
+            shortcut: None,
         },
     ]
 }

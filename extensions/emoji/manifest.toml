@@ -1,6 +1,6 @@
-api = 5
+api = 6
 name = "emoji"
-version = "0.3.1"
+version = "0.4.0"
 description = "Search emoji by name and copy them to the clipboard"
 author = "Portunus examples"
 kinds = ["ext-emoji"]

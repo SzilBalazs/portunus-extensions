@@ -1,6 +1,6 @@
-api = 5
+api = 6
 name = "ytm"
-version = "0.4.0"
+version = "0.5.0"
 description = "Search YouTube Music and control playback - play now, play next, add to queue. Requires the Firefox companion (companions/firefox-ytm), which runs search and playback in your logged-in music.youtube.com tab."
 author = "Portunus examples"
 homepage = "https://music.youtube.com"
@@ -43,9 +43,8 @@ volatile = true
 
 # Library view: lists your playlists; open one to drill into its tracks.
 # min_query_len = 0 so it populates on entry with no typing. Opening a playlist
-# records the drill-in target in the extension's KV (not the query bar), so the
-# bar stays a clean filter box - typing filters the list, or the open playlist's
-# tracks. A "back" row returns to the list.
+# pushes a scope frame carrying its browseId (PushScope effect) - the query bar
+# stays a clean filter box and Esc/Backspace pops back to the list.
 [[commands]]
 name = "playlists"
 title = "YT Music Library"
@@ -56,6 +55,10 @@ min_query_len = 0
 chip = "YT Library"
 icon = "icon.b64"
 placeholder = "Filter playlists…"
+# `always` so the `search` export also runs at root: when the toggles below are
+# on it surfaces cached playlists/tracks matching the root query, without having
+# to enter the scope first. The heavy async `query` tier stays scope-only.
+always = true
 # Playlist order (and, in the drill-in, track order) is intrinsic - opt out of
 # frecency so a frequently-opened playlist or track never floats out of place.
 frecency = false
@@ -72,6 +75,40 @@ description = "How many song matches to show. Fewer means fewer album-art fetche
 default = 5
 min = 1
 max = 15
+step = 1
+
+[[settings]]
+key = "search_playlists_at_root"
+type = "bool"
+label = "Show playlists in root search"
+description = "Match your cached playlists directly from the main search box, without entering the YT Music Library first. Uses only the cached library (open the Library once to populate it)."
+default = false
+
+[[settings]]
+key = "search_tracks_at_root"
+type = "bool"
+label = "Show playlist tracks in root search"
+description = "Also match individual tracks from playlists you've opened, directly from the main search box. Cached-only; noisier results."
+default = false
+
+[[settings]]
+key = "max_playlist_rows_at_root"
+type = "number"
+label = "Max playlists in root search"
+description = "How many cached playlists to show in the main search box. The launcher caps the whole root result set anyway, so higher values may not all appear."
+default = 3
+min = 1
+max = 9
+step = 1
+
+[[settings]]
+key = "max_track_rows_at_root"
+type = "number"
+label = "Max tracks in root search"
+description = "How many cached tracks to show in the main search box. The launcher caps the whole root result set anyway, so higher values may not all appear."
+default = 3
+min = 1
+max = 9
 step = 1
 
 [permissions]

@@ -386,7 +386,7 @@ struct Playlist {
 /// Actions on a playlist card. Default (Enter) drills into the tracklist; the
 /// browser open is a secondary choice.
 fn playlist_actions() -> Vec<Action> {
-    // `open_tracks` drills in via a SetQuery + KeepOpen (see `activate`), so it
+    // `open_tracks` drills in via a PushScope effect (see `activate`), so it
     // keeps the launcher open - `opens_form` makes the host skip the optimistic
     // hide, same trick as the other keep-open rows.
     vec![
@@ -453,36 +453,10 @@ fn companion_get_playlist_tracks(browse_id: &str) -> Result<Vec<Song>, String> {
     Ok(songs_from_items(&items))
 }
 
-/// KV key holding the current drill-in target: `"<browseId>\t<ts_ms>"`. Kept
-/// out of the query bar so the bar is a clean filter box. Short-lived: it's the
-/// current navigation, not a saved preference.
-const PLNAV_KEY: &str = "plnav";
-/// How long a drill-in stays "current" without interaction. Refreshed on every
-/// in-playlist query, so active filtering keeps it alive; re-entering the
-/// command after this window shows the playlist list again (not a stale drill-in).
-const PLNAV_TTL_MS: u64 = 20_000;
-
-/// The current drill-in browseId, if one is set and still fresh. A stale/absent
-/// entry reads as None (the caller then shows the playlist list).
-fn plnav_get() -> Option<String> {
-    let v = guest::kv_read(PLNAV_KEY).ok()??;
-    let (bid, ts) = v.split_once('\t')?;
-    let ts: u64 = ts.parse().ok()?;
-    let now = guest::now().unwrap_or(0);
-    (now.saturating_sub(ts) < PLNAV_TTL_MS).then(|| bid.to_string())
-}
-
-/// Records `browse_id` as the current drill-in (stamped now). Also called on
-/// each in-playlist query to refresh the freshness window.
-fn plnav_set(browse_id: &str) {
-    let now = guest::now().unwrap_or(0);
-    let _ = guest::kv_write(PLNAV_KEY, &format!("{browse_id}\t{now}"));
-}
-
-/// Clears the drill-in (back to the playlist list).
-fn plnav_clear() {
-    let _ = guest::kv_remove(PLNAV_KEY);
-}
+// The drill-in target is no longer a KV side-channel: it rides on the scope
+// frame as `ScopeContext::data` (set by the `PushScope` activate effect and
+// handed back to `search`/`query`). Entering a playlist pushes a frame carrying
+// its browseId; Esc/Backspace pops it. No TTL, no query-bar clearing hack.
 
 // Playlist caches (stale-while-revalidate). The library list and each opened
 // playlist's tracks are cached in KV so re-entering a seen playlist is instant.
@@ -531,45 +505,27 @@ fn cache_age(ts: u64) -> u64 {
     guest::now().unwrap_or(0).saturating_sub(ts)
 }
 
-/// The "back to playlists" row, pinned to the top of a drill-in. Activating it
-/// clears the drill-in and returns to the list (see `activate`). Relevance above
-/// any track's so it sorts first.
-fn back_row() -> ExtensionResult {
-    ExtensionResult {
-        id: "plback".into(),
-        title: "\u{25C0} All playlists".into(),
-        subtitle: Some("Back to your library".into()),
-        relevance: 200.0,
-        actions: vec![Action { id: "back".into(), label: "Back to playlists".into(), hint: None, opens_form: true, shortcut: None }],
-        icon: Some(icon()),
-        badge: None,
+/// Handles the `playlists` command query for an entered scope frame. `data` is
+/// the frame's [`ScopeContext::data`]: `Some(browseId)` drills into that
+/// playlist's tracks (the typed term filters them), `None` lists the library.
+/// Both are stale-while-revalidate: a warm cache renders instantly, then the
+/// companion is asked for the current data and the view is re-emitted only if
+/// it changed. Back-navigation is native (Esc/Backspace pops the frame).
+fn query_playlists(data: Option<&str>, term: &str) {
+    match data {
+        Some(browse_id) => query_playlist_tracks(browse_id, term),
+        None => query_playlist_list(term),
     }
 }
 
-/// Handles the `playlists` command query. With a drill-in recorded in KV, emits
-/// that playlist's tracks (the typed term filters them) plus a back row;
-/// otherwise lists the library's playlists (the term filters the list). Both are
-/// stale-while-revalidate: a warm cache renders instantly, then the companion is
-/// asked for the current data and the view is re-emitted only if it changed.
-fn query_playlists(term: &str) {
-    if let Some(browse_id) = plnav_get() {
-        plnav_set(&browse_id); // refresh the freshness window on active use
-        query_playlist_tracks(&browse_id, term);
-        return;
-    }
-
-    // No (fresh) drill-in: clear any stale entry and show the playlist list.
-    plnav_clear();
-    query_playlist_list(term);
-}
-
-/// Rows for the instant `search` tier of the playlists command, built from the
-/// KV cache only (no companion call, no network — art is cached-only). Returns
-/// the current drill-in's tracks, else the library list; empty when the cache
-/// is cold or expired (the async `query` then shows the first-load spinner).
-fn playlists_instant_rows(term: &str) -> Vec<ExtensionResult> {
-    if let Some(browse_id) = plnav_get() {
-        if let Some((tracks, ts)) = cache_read::<Vec<Song>>(&pltracks_key(&browse_id)) {
+/// Rows for the instant `search` tier of an entered playlists scope, built from
+/// the KV cache only (no companion call, no network — art is cached-only).
+/// `data = Some(browseId)` returns that playlist's tracks, `None` the library
+/// list; empty when the cache is cold or expired (the async `query` then shows
+/// the first-load spinner).
+fn playlists_instant_rows(data: Option<&str>, term: &str) -> Vec<ExtensionResult> {
+    if let Some(browse_id) = data {
+        if let Some((tracks, ts)) = cache_read::<Vec<Song>>(&pltracks_key(browse_id)) {
             if cache_age(ts) < CACHE_TTL_MS {
                 return playlist_track_rows(&tracks, term).0;
             }
@@ -582,6 +538,88 @@ fn playlists_instant_rows(term: &str) -> Vec<ExtensionResult> {
         }
     }
     Vec::new()
+}
+
+/// Root-search rows for the `playlists` always-command (the query runs at root
+/// only when a scope isn't entered). Surfaces cached playlists and/or cached
+/// tracks matching `term`, each gated by its "surface at root" setting. KV-only
+/// (no companion, no network) so it stays within the 50 ms search budget; a
+/// cold cache yields nothing until the user has opened the library once.
+fn root_playlist_rows(term: &str) -> Vec<ExtensionResult> {
+    let t = term.trim();
+    if t.is_empty() {
+        return Vec::new();
+    }
+    let mut rows = Vec::new();
+
+    if setting_flag("search_playlists_at_root") {
+        if let Some((pls, ts)) = cache_read::<Vec<Playlist>>(PLISTS_KEY) {
+            if cache_age(ts) < CACHE_TTL_MS {
+                let mut visible = visible_playlists(&pls, t);
+                visible.truncate(root_cap("max_playlist_rows_at_root"));
+                let n = visible.len();
+                rows.extend(visible.iter().enumerate().map(|(i, p)| {
+                    let ic = cached_icon(&p.browse_id).unwrap_or_else(icon);
+                    playlist_result(p, ranked(i, n), ic)
+                }));
+            }
+        }
+    }
+
+    if setting_flag("search_tracks_at_root") {
+        // Scan every cached tracklist; dedupe by video id so a song in several
+        // playlists shows once. Stop once the configured row cap is reached
+        // (itself bounded by ROOT_TRACK_CAP as an absolute scan ceiling).
+        let cap = root_cap("max_track_rows_at_root").min(ROOT_TRACK_CAP);
+        let mut seen = std::collections::HashSet::new();
+        let mut tracks: Vec<Song> = Vec::new();
+        if let Ok(keys) = guest::kv_keys("pltracks:") {
+            'outer: for key in keys {
+                let Some((cached, ts)) = cache_read::<Vec<Song>>(&key) else { continue };
+                if cache_age(ts) >= CACHE_TTL_MS {
+                    continue;
+                }
+                for s in visible_tracks(&cached, t) {
+                    if !s.video_id.is_empty() && seen.insert(s.video_id.clone()) {
+                        tracks.push(s.clone());
+                        if tracks.len() >= cap {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+        let n = tracks.len();
+        rows.extend(tracks.iter().enumerate().map(|(i, s)| {
+            let ic = cached_icon(&s.video_id).unwrap_or_else(icon);
+            song_result(s, ranked(i, n), ic)
+        }));
+    }
+
+    rows
+}
+
+/// Cap on cached tracks scanned/emitted for the root-search toggle.
+const ROOT_TRACK_CAP: usize = 30;
+
+/// Reads a boolean setting, defaulting to `false` when unset/absent.
+fn setting_flag(key: &str) -> bool {
+    guest::setting_bool(key).ok().flatten().unwrap_or(false)
+}
+
+/// Default per-type root-row cap when the setting is unset.
+const DEFAULT_ROOT_CAP: usize = 3;
+
+/// Max root-search rows for one type (playlists or tracks), from its number
+/// setting (clamped to 1..=ROOT_TRACK_CAP). The launcher truncates the whole
+/// root set to its own max_results, so this only bounds YTM's contribution.
+fn root_cap(key: &str) -> usize {
+    guest::setting_num(key)
+        .ok()
+        .flatten()
+        .map(|n| n as usize)
+        .unwrap_or(DEFAULT_ROOT_CAP)
+        .clamp(1, ROOT_TRACK_CAP)
 }
 
 /// Drill-in view: serve the cached tracklist instantly, then revalidate against
@@ -611,7 +649,7 @@ fn query_playlist_tracks(browse_id: &str, term: &str) {
         Err(e) => {
             let _ = guest::debug(&format!("get_playlist_tracks failed: {e}"));
             if !shown {
-                let _ = guest::emit(vec![back_row(), info_result("Couldn't load playlist", &e)]);
+                let _ = guest::emit(vec![info_result("Couldn't load playlist", &e)]);
             }
         }
     }
@@ -658,11 +696,11 @@ fn query_playlist_list(term: &str) {
     }
 }
 
-/// Emits a drill-in view: the back row plus the playlist's tracks (filtered by
-/// `term`). Two-pass art like [`emit_queue`]; the back row rides along in both
-/// emits so it's present from the first frame and under `volatile` replacement.
+/// Emits a drill-in view: the playlist's tracks (filtered by `term`). Two-pass
+/// art like [`emit_queue`]. Back-navigation is native (Esc/Backspace pops the
+/// scope frame), so there is no in-list back row.
 fn emit_playlist_tracks(tracks: &[Song], term: &str) {
-    // Pass 1: back row + tracks with cached art only (no network, no flicker).
+    // Pass 1: tracks with cached art only (no network, no flicker).
     let (first, any_miss) = playlist_track_rows(tracks, term);
     let _ = guest::emit(first);
     if !any_miss {
@@ -672,11 +710,14 @@ fn emit_playlist_tracks(tracks: &[Song], term: &str) {
     let visible = visible_tracks(tracks, term);
     let n = visible.len();
     let mut budget = ART_FETCH_BUDGET;
-    let mut second = vec![back_row()];
-    second.extend(visible.iter().enumerate().map(|(i, s)| {
-        let ic = row_icon(&s.video_id, s.thumb_url.as_deref(), &mut budget);
-        song_result(s, ranked(i, n), ic)
-    }));
+    let second: Vec<ExtensionResult> = visible
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let ic = row_icon(&s.video_id, s.thumb_url.as_deref(), &mut budget);
+            song_result(s, ranked(i, n), ic)
+        })
+        .collect();
     let _ = guest::emit(second);
 }
 
@@ -695,19 +736,19 @@ fn visible_tracks<'a>(tracks: &'a [Song], term: &str) -> Vec<&'a Song> {
         .collect()
 }
 
-/// Builds the drill-in rows (back row + tracks) using cached art only. Returns
-/// the rows and whether any track has art still to fetch. Shared by the instant
-/// `search` tier (which stops here, no network) and `emit_playlist_tracks`.
+/// Builds the drill-in track rows using cached art only. Returns the rows and
+/// whether any track has art still to fetch. Shared by the instant `search`
+/// tier (which stops here, no network) and `emit_playlist_tracks`.
 fn playlist_track_rows(tracks: &[Song], term: &str) -> (Vec<ExtensionResult>, bool) {
     let visible = visible_tracks(tracks, term);
     if visible.is_empty() {
         let msg = if tracks.is_empty() { "Empty playlist" } else { "No matching tracks" };
         let sub = if tracks.is_empty() { "This playlist has no tracks" } else { "Nothing here matches that" };
-        return (vec![back_row(), info_result(msg, sub)], false);
+        return (vec![info_result(msg, sub)], false);
     }
     let n = visible.len();
     let mut any_miss = false;
-    let mut rows = vec![back_row()];
+    let mut rows = Vec::new();
     rows.extend(visible.iter().enumerate().map(|(i, s)| {
         let ic = cached_icon(&s.video_id).unwrap_or_else(|| {
             if !s.video_id.is_empty() && s.thumb_url.as_deref().is_some_and(|u| !u.is_empty()) {
@@ -785,8 +826,14 @@ pub fn search(input: Json<SearchInput>) -> FnResult<Json<SearchOutput>> {
     // The playlists command fills this instant tier from the KV cache so a
     // warm view (list or an opened tracklist) paints with no loading spinner
     // between keystrokes; the async `query` then revalidates and adds art.
+    // At root (scope = None, an `always`-command discovery hit) it instead
+    // surfaces cached playlists/tracks matching the query, gated by settings.
     if input.0.command == "playlists" {
-        return Ok(Json(SearchOutput { results: playlists_instant_rows(&input.0.query) }));
+        let results = match &input.0.scope {
+            None => root_playlist_rows(&input.0.query),
+            Some(ctx) => playlists_instant_rows(ctx.data.as_deref(), &input.0.query),
+        };
+        return Ok(Json(SearchOutput { results }));
     }
 
     // The queue command (min_query_len = 0) has no instant cache; it's populated
@@ -837,10 +884,14 @@ pub fn query(input: Json<QueryInput>) -> FnResult<Json<QueryOutput>> {
         return Ok(Json(QueryOutput::default()));
     }
 
-    // Library command: the playlist list, or (with a "pl:<browseId>" term set by
-    // the drill-in) that playlist's tracks.
+    // Library command. In an entered scope, revalidate the current frame: the
+    // playlist list (data = None) or a drilled-in playlist's tracks (data =
+    // Some(browseId)). At root (scope = None) the sync `search` tier already
+    // painted cached rows — don't touch the companion here.
     if input.0.command == "playlists" {
-        query_playlists(&term);
+        if let Some(ctx) = &input.0.scope {
+            query_playlists(ctx.data.as_deref(), &term);
+        }
         return Ok(Json(QueryOutput::default()));
     }
 
@@ -1004,17 +1055,6 @@ pub fn activate(input: Json<ActivateInput>) -> FnResult<Json<ActivateOutput>> {
         return Ok(Json(activate_queue(id, action)));
     }
 
-    // The "back to playlists" row: clear the drill-in and show the list again.
-    // Empty the filter box and requery (KeepOpen; SetQuery alone would hide).
-    if id == "plback" {
-        plnav_clear();
-        return Ok(Json(
-            ActivateOutput::set_query(String::new())
-                .and(ActivateEffect::SelectFirst {})
-                .and(ActivateEffect::KeepOpen {}),
-        ));
-    }
-
     // Playlist cards: drill into the tracklist, or open in the browser.
     if let Some(browse_id) = id.strip_prefix("pl:") {
         if action == "open" {
@@ -1024,16 +1064,12 @@ pub fn activate(input: Json<ActivateInput>) -> FnResult<Json<ActivateOutput>> {
                 "https://music.youtube.com/playlist?list={list}"
             ))));
         }
-        // Drill in: record the target in KV (not the query bar) and clear the
-        // filter box. The requery finds the fresh drill-in and emits the
-        // playlist's tracks. KeepOpen so the launcher stays up (SetQuery alone
-        // defaults to hide).
-        plnav_set(browse_id);
-        return Ok(Json(
-            ActivateOutput::set_query(String::new())
-                .and(ActivateEffect::SelectFirst {})
-                .and(ActivateEffect::KeepOpen {}),
-        ));
+        // Native drill-in: push a scope frame carrying the browseId. The requery
+        // for the new frame reads it back as `ScopeContext::data` and emits this
+        // playlist's tracks; the playlist title becomes the breadcrumb segment.
+        // Esc/Backspace pops back to the library — no back row, no KV state.
+        let chip = input.0.result.title.clone();
+        return Ok(Json(ActivateOutput::push_scope(browse_id, chip)));
     }
 
     let Some(video_id) = decode_meta(id).map(|m| m.v).filter(|v| !v.is_empty()) else {
